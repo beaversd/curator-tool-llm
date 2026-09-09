@@ -39,3 +39,8 @@ chainlit.md
 
 # deploy.sh --keep-archive
 dist/
+
+*.py[cod]
+
+# Local virtual environments
+.venv/
