@@ -25,7 +25,7 @@ import os, re, json, time
 
 import requests
 
-PROJECT_ROOT = os.path.expanduser('~/curator-tool-llm')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNIPROT_CACHE = os.path.join(PROJECT_ROOT, 'data', 'uniprot_names.json')
 UNIPROT_URL = 'https://rest.uniprot.org/uniprotkb/{acc}.json'
 

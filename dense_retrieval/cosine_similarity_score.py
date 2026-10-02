@@ -29,7 +29,7 @@ Usage:
 """
 import os, sys, json, re, argparse
 
-PROJECT_ROOT = os.path.expanduser('~/curator-tool-llm')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
 

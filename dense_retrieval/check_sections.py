@@ -31,7 +31,7 @@ actually uses. That is one request per chunk plus one for the section — they a
 billed as input tokens, but they do count against request rate limits.
 """
 import os, sys, json, argparse
-PROJECT_ROOT = os.path.expanduser('~/curator-tool-llm')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'reactome_llm'))
 from dotenv import load_dotenv

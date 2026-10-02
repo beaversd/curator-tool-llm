@@ -33,7 +33,7 @@ import os, re, sys, csv, json, time, argparse
 import warnings
 warnings.filterwarnings('ignore')
 
-PROJECT_ROOT = os.path.expanduser('~/curator-tool-llm')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'reactome_llm'))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, '.env'), override=True)
