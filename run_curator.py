@@ -39,7 +39,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import token_profiler
-import fulltext_extractor
+import data.fulltext_extractor as fulltext_extractor
 import FullTextResolver
 import ReactomeNeo4jUtils as neo4j_utils
 from ReactomeCurator import ReactomeCurator
