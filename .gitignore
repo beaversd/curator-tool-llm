@@ -44,3 +44,6 @@ dist/
 
 # Local virtual environments
 .venv/
+
+# Deploy tarballs (scripts/package_pmid.sh)
+dist/

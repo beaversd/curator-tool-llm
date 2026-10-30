@@ -43,6 +43,17 @@ from curator_llm.model_settings import anthropic_kwargs
 MODEL_KW = anthropic_kwargs('merge')     # model + thinking (curator_llm/model_settings.py)
 # Judge / consolidate / validate calls use the 'merge' role: thinking is off by default (same merges, ~1.7x faster)
 # and Haiku is not a safe judge; see curator_llm/model_settings.py. Override with LLM_MODEL_MERGE / LLM_THINKING_MERGE.
+# Reasoning depth per call (output_config.effort: low|medium|high|xhigh|max; API default high).
+# The pairwise judge fans out over every pair, so it is the cheapest place to save; it starts at
+# medium rather than low because a hard pair that runs out of reasoning reads as "not duplicate".
+# Env overrides are for effort sweeps without editing code.
+EFFORT_JUDGE = os.getenv('MERGE_EFFORT_JUDGE', 'medium')
+EFFORT_CONSOLIDATE = os.getenv('MERGE_EFFORT_CONSOLIDATE', 'high')
+EFFORT_SPLIT = os.getenv('MERGE_EFFORT_SPLIT', 'high')
+
+def _effort(level):
+    """output_config for a call; 'default' omits it so the model runs at its own default effort."""
+    return {} if level == 'default' else {'output_config': {'effort': level}}
 
 # Token accounting over every judge/consolidate call, so a run can be costed. The
 # judge fans out over ThreadPoolExecutor, so the counters are lock-guarded.
@@ -173,6 +184,34 @@ def _reaction_brief(a):
 # final count may under-merge. Reported at the end rather than lost in the log.
 failures = []
 
+def _reply_text(msg):
+    """All text blocks of a reply joined. Thinking/other blocks have no .text; and a reply can
+    come in more than one text block, so taking only the first can cut the JSON off."""
+    return '\n'.join(b.text for b in msg.content if getattr(b, 'type', None) == 'text')
+
+
+def _reply_json(txt):
+    """The JSON object in a reply. claude-sonnet-5 returns bare JSON as asked, but
+    claude-sonnet-5-5 and claude-opus-5-5 often write an explanation first and put the JSON
+    last, which json.loads(txt) rejects at char 0. Takes the last top-level object found."""
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError as first_error:
+        dec, found, i = json.JSONDecoder(), None, txt.find('{')
+        while i != -1:
+            try:
+                obj, end = dec.raw_decode(txt, i)
+            except json.JSONDecodeError:
+                i = txt.find('{', i + 1)
+                continue
+            if isinstance(obj, dict):
+                found = obj
+            i = txt.find('{', end)
+        if found is None:
+            raise first_error
+        return found
+
+
 def _conf(x):
     """Judge confidence clamped to 0-1, or None when the model returned none/garbage."""
     try:
@@ -251,18 +290,19 @@ def reactions_are_duplicate(a1, a2):
             # ZNFX1 pairs, but a hard pair would silently return "not duplicate", so leave room.
             # the rules come before "Reaction A:" and are identical for every pair: cache them
             cut = prompt.index('Reaction A:')
-            msg = client.messages.create(**MODEL_KW, max_tokens=4000, messages=[{'role': 'user', 'content': [
+            msg = client.messages.create(**MODEL_KW, max_tokens=4000,
+                                         **_effort(EFFORT_JUDGE), messages=[{'role': 'user', 'content': [
                 {'type': 'text', 'text': prompt[:cut], 'cache_control': {'type': 'ephemeral'}},
                 {'type': 'text', 'text': prompt[cut:]}]}])
             # Skip thinking/other blocks; take the first text block. With extended
             # thinking on, content[0] is a ThinkingBlock (no .text) and would crash.
             track_usage(msg)
-            txt = next((b.text for b in msg.content if getattr(b, 'type', None) == 'text'), '')
+            txt = _reply_text(msg)
             txt = txt.strip().replace('```json','').replace('```','').strip()
             if not txt:
                 raise ValueError(f'no text block in response (stop_reason={msg.stop_reason})')
             try:
-                got = json.loads(txt)
+                got = _reply_json(txt)
                 return bool(got.get('same', False)), _conf(got.get('confidence'))
             except json.JSONDecodeError:
                 # truncated or malformed JSON — the verdict is still readable
@@ -459,13 +499,14 @@ Return ONLY JSON with exactly these keys:
             # 8000 was not enough: on ZNFX1's 7-variant cluster thinking consumed the whole
             # ceiling and the reply carried no answer, leaving that reaction unconsolidated
             msg = client.messages.create(**MODEL_KW, max_tokens=16000,
+                                         **_effort(EFFORT_CONSOLIDATE),
                                          messages=[{'role': 'user', 'content': prompt}])
             track_usage(msg)
-            txt = next((b.text for b in msg.content if getattr(b, 'type', None) == 'text'), '')
+            txt = _reply_text(msg)
             txt = txt.strip().replace('```json', '').replace('```', '').strip()
             if not txt:
                 raise ValueError(f'no text block in response (stop_reason={msg.stop_reason})')
-            got = json.loads(txt)
+            got = _reply_json(txt)
             out = dict(a)
             # a list that came back LONGER than it went in means the model invented
             # items — reject that subsection and keep the code-merged version
@@ -565,13 +606,14 @@ Return ONLY JSON: {{"valid_single_cluster": <true|false>, "groups": [[1, 2], [3]
             # answer. A ceiling of 2000 was spent entirely on thinking and returned no answer,
             # which silently meant "do not split" on the very clusters most in need of splitting.
             msg = client.messages.create(**MODEL_KW, max_tokens=16000,
+                                         **_effort(EFFORT_SPLIT),
                                          messages=[{'role': 'user', 'content': prompt}])
             track_usage(msg)
-            txt = next((b.text for b in msg.content if getattr(b, 'type', None) == 'text'), '')
+            txt = _reply_text(msg)
             txt = txt.strip().replace('```json', '').replace('```', '').strip()
             if not txt:
                 raise ValueError(f'no text block in response (stop_reason={msg.stop_reason})')
-            got = json.loads(txt)
+            got = _reply_json(txt)
             raw = got.get('groups')
             if got.get('valid_single_cluster') and not raw:
                 return [list(idxs)]

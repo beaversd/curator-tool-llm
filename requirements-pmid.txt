@@ -1,0 +1,19 @@
+# Minimal dependencies for the per-PMID pipeline only
+# (run_extraction.py -> run_merge.py -> run_review.py, wrapped by scripts/run_pmid.sh).
+# No Neo4j, MongoDB, torch or embedding stack. For the full gene-first pipeline / REST API
+# use requirements.txt instead.
+
+anthropic>=0.40
+openai>=1.40,<2
+langchain-core>=1.0
+langchain-text-splitters>=1.0
+langgraph>=1.0
+pydantic>=2
+python-dotenv
+requests
+PyMuPDF
+rapidfuzz
+jsonpatch
+
+# Neo4j (merging against your own database; set REACTOME_NEO4J_* in .env)
+neo4j

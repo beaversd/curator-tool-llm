@@ -45,6 +45,9 @@ client = anthropic.Anthropic(api_key=os.getenv('ANTHROPIC_API_KEY'), timeout=120
 from curator_llm.model_settings import anthropic_kwargs, model_name
 MODEL_NAME = model_name('sections')       # also what the Results-section lookup in load_source() uses
 MODEL_KW = anthropic_kwargs('extraction')  # model + thinking for the extraction calls (curator_llm/model_settings.py)
+# Reasoning depth (output_config.effort: low|medium|high|xhigh|max; API default high).
+# Env override is for effort sweeps without editing code.
+EFFORT_EXTRACT = os.getenv('EXTRACT_EFFORT', 'high')
 PREV_WINDOW = 2   # previous chunks' reaction-notes kept as backward context
 
 # Token accounting across every API call this run makes, so a pipeline run can be
@@ -86,7 +89,8 @@ def extract_reactions(current_chunk, prev_contexts, next_context, raw_prev=False
                                             raw_prev=raw_prev, split=True)
     try:
         # the head (instructions) is the same for every chunk: mark it for prompt caching
-        msg = client.messages.create(**MODEL_KW, max_tokens=16000, messages=[{'role': 'user', 'content': [
+        msg = client.messages.create(**MODEL_KW, max_tokens=16000,
+                                     output_config={'effort': EFFORT_EXTRACT}, messages=[{'role': 'user', 'content': [
             {'type': 'text', 'text': head, 'cache_control': {'type': 'ephemeral'}},
             {'type': 'text', 'text': tail}]}])
     except Exception as e:

@@ -28,6 +28,7 @@ The curator-tool-frontend uses it, and you can call it directly. See
 - [Configuration (.env)](#configuration-env)
 - [Running it](#running-it)
 - [Running the REST service](#running-the-rest-service-paper-annotation-and-chat)
+- [Deploying the per-PMID pipeline](#deploying-the-per-pmid-pipeline)
 - [How to read the result](#how-to-read-the-result)
 - [How full-text extraction works (Tool 4)](#how-full-text-extraction-works-tool-4)
 - [Repository layout](#repository-layout)
@@ -581,6 +582,32 @@ The suite uses fakes for ws, Neo4j and the models. A few tests run against the r
 is not available: the Neo4j graph (`tests/test_neo4j_lookup.py`, `tests/test_existing_events.py`), MongoDB
 (`tests/test_sessions_store.py`, which uses a throwaway collection) and a running curator-tool-ws with `WS_USERNAME` /
 `WS_PASSWORD` in `.env` (`tests/test_ws_contract.py`).
+
+---
+
+## Deploying the per-PMID pipeline
+
+To run only extraction -> merge -> review for a single PMID (optionally labelled with a gene),
+you need the Anthropic, OpenAI and NCBI keys plus the `REACTOME_NEO4J_*` settings for your Neo4j database.
+MongoDB and the ML stack are not needed.
+
+```bash
+# on your machine
+scripts/package_pmid.sh                       # -> dist/curator-pmid-<sha>.tar.gz
+
+# on the server (Python 3.10+)
+mkdir -p /opt/curator-pmid && tar -xzf curator-pmid-*.tar.gz -C /opt/curator-pmid
+cd /opt/curator-pmid
+python3 -m venv .venv && .venv/bin/pip install -r requirements-pmid.txt
+cp .env.pmid.example .env && chmod 600 .env   # fill in the keys
+
+scripts/run_pmid.sh 24751536                  # -> results/pmid24751536_{extraction,merged}.json, _review.md
+scripts/run_pmid.sh 24751536 PINK1            # -> results/pink1_pmid24751536_*
+scripts/run_pmid.sh 24751536 PINK1 --no-review
+```
+
+Exit codes: `0` ok, `1` usage/config error, `2` no usable PMC full text (no reactions), `3` a step failed.
+Only open-access papers in PMC can be extracted this way; PMC XML is cached under `data/pmc/`.
 
 ---
 
