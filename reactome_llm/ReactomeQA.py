@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from reaction_to_instances import build_instances
 import ReactomeNeo4jUtils as neo4j_utils
 from ModelConfig import create_reactome_chat_model
+from curator_llm.model_settings import structured_output
 from ReactomeModels import QAReport
 import token_profiler
 import logging_config
@@ -291,7 +292,7 @@ class ReactomeQA:
                 schema_findings=json.dumps(schema_check),
                 consistency_findings=json.dumps(consistency_check))
             with token_profiler.label("qa_llm_review"):
-                report: QAReport = model.with_structured_output(QAReport).invoke(prompt)
+                report: QAReport = structured_output(model, QAReport).invoke(prompt)
             data = report.model_dump()
             data.setdefault("gene", gene)
             return data

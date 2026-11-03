@@ -111,6 +111,7 @@ class ReactomeReviewer:
     # ------------------------------------------------------------------ LLM reviewer
     def _llm_review(self, result, attempt, max_attempts, history) -> Verdict:
         from ModelConfig import create_reactome_chat_model
+        from curator_llm.model_settings import structured_output
         import token_profiler
 
         retries_left = max(0, max_attempts - 1 - attempt)
@@ -121,7 +122,7 @@ class ReactomeReviewer:
 
         model = self.model or create_reactome_chat_model()
         with token_profiler.label("reviewer_llm"):
-            rv: ReviewVerdict = model.with_structured_output(ReviewVerdict).invoke(prompt)
+            rv: ReviewVerdict = structured_output(model, ReviewVerdict).invoke(prompt)
 
         decision = (rv.decision or "").strip().lower()
         if decision not in ("sufficient", "retry", "give_up"):

@@ -37,7 +37,7 @@ if _REACTOME_LLM not in sys.path:
 
 from langchain_anthropic import ChatAnthropic
 import token_profiler
-from curator_llm.model_settings import langchain_kwargs
+from curator_llm.model_settings import langchain_kwargs, structured_output
 from ReactomeModels import ReactomeDataModel
 
 logger = logging.getLogger(__name__)
@@ -230,7 +230,7 @@ def build_instances(gene, reactions, accession=None, placement=None,
     prompt = build_prompt(gene, reactions, accession, placement, placement_status,
                           target_pathways, fix_notes=fix_notes)
     try:
-        model = _model().with_structured_output(ReactomeDataModel)
+        model = structured_output(_model(), ReactomeDataModel)
         result = model.invoke(prompt)
     except Exception as e:
         logger.warning("convert: reaction->instance conversion failed for %s: %s", gene, e)

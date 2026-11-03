@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from curator_llm.models.reactome import (CatalystSpec, ComplexSpec, DefinedSetSpec, EwasSpec, GoActivity,
                                          ModifiedResidueSpec, PathwaySpec, ReactionSpec, ReactomeDraft,
                                          RegulationSpec, SimpleEntitySpec)
+from curator_llm.model_settings import structured_output
 from curator_llm.models.usage import UsageEntry
 from curator_llm.services.resolvers import PSI_MOD
 from curator_llm.services.sources import record_pmids as _record_pmids
@@ -228,6 +229,12 @@ def assemble(gene: str, reactions: List[dict], ex: DraftExtraction,
     return d, notes
 
 
+# The draft is one JSON reply covering every reaction, so it can be long. Set explicitly: langchain-anthropic
+# gives a model it has no profile for (claude-sonnet-5-5) only 4096 output tokens, which cut the JSON short
+# ("Failed to parse DraftExtraction from completion"). Same ceiling as reaction_to_instances.py.
+_DRAFT_MAX_TOKENS = 64000
+
+
 def build_draft(gene: str, reactions: List[dict], accession: Optional[str] = None, model: Any = None,
                 pathway_name: Optional[str] = None,
                 usage: Optional[List[UsageEntry]] = None) -> Tuple[ReactomeDraft, List[str]]:
@@ -240,10 +247,10 @@ def build_draft(gene: str, reactions: List[dict], accession: Optional[str] = Non
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'reactome_llm'))
         from ModelConfig import create_chat_model
-        model = create_chat_model('draft')
+        model = create_chat_model('draft', max_tokens=_DRAFT_MAX_TOKENS)
     counter = UsageMetadataCallbackHandler()          # the structured-output wrapper hides the raw reply's usage
-    ex = model.with_structured_output(DraftExtraction).invoke(build_prompt(gene, reactions, accession),
-                                                              config={'callbacks': [counter]})
+    ex = structured_output(model, DraftExtraction).invoke(build_prompt(gene, reactions, accession),
+                                                    config={'callbacks': [counter]})
     if usage is not None:
         for name, u in counter.usage_metadata.items():
             detail = u.get('input_token_details') or {}

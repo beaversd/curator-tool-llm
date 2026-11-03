@@ -40,7 +40,7 @@ prose touch an LLM.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from GenePathwayAnnotator import GenePathwayAnnotator
 from QueryBuilder import (build_retrieval_query_pair, get_reranking_target,
@@ -76,11 +76,13 @@ class ReactomeLiteratureExtractor:
                 candidate_pool: int = DEFAULT_CANDIDATE_POOL,
                 min_score: int = DEFAULT_MIN_SCORE,
                 adjustment: Optional[Dict[str, Any]] = None,
-                placement: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                placement: Optional[Dict[str, Any]] = None,
+                report: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
         """Gene -> the papers to annotate from.
 
         `adjustment`: the Reviewer's proposed changes for a re-run (or None on the first
         attempt). See the module docstring for honored keys.
+        `report` (optional): called with a short progress message as each step starts.
 
         Returns:
             {
@@ -98,6 +100,7 @@ class ReactomeLiteratureExtractor:
         gene = (gene or "").strip().upper()
         max_papers, candidate_pool, min_score, additional_terms, avoid_pmids = \
             self._apply_adjustment(adjustment, max_papers, candidate_pool, min_score)
+        report = report or (lambda msg: None)
         logger.info(f"Literature extraction for {gene} (adjustment={adjustment or 'none'})")
 
         accession = self.gene_annotator.resolve_uniprot_accession(gene)
@@ -105,11 +108,12 @@ class ReactomeLiteratureExtractor:
 
         # Rerank context: gene-specific pathway descriptions (best), else a gate-fail gene
         # background. Passed straight into re-rank + judge (no worker-thread/stash needed here).
+        report(f"describing {gene}'s pathways")
         description, pathway_descs = self._build_rerank_context(gene, placement=placement)
 
         cand = self._retrieve_candidates(gene, candidate_pool, description, pathway_descs,
                                          additional_terms=additional_terms, avoid_pmids=avoid_pmids,
-                                         placement=placement)
+                                         placement=placement, report=report)
         candidates = cand["papers"]
         base = {"gene": gene, "accession": accession,
                 "name_query": cand["name_query"], "context_query": cand["context_query"],
@@ -129,6 +133,7 @@ class ReactomeLiteratureExtractor:
             prose = None
         judge_context = build_judge_context(gene, description=prose)
 
+        report(f"judging {len(candidates)} candidate papers")
         with token_profiler.label("litextract_judge"):
             judged = judge_select(gene, judge_context, candidates,
                                   max_papers=max_papers, min_score=min_score)
@@ -164,7 +169,8 @@ class ReactomeLiteratureExtractor:
                              description: Optional[str], pathway_descs: Optional[dict],
                              fetch_papers: int = 200, additional_terms: str = "",
                              avoid_pmids: Optional[set] = None,
-                             placement: Optional[dict] = None) -> dict:
+                             placement: Optional[dict] = None,
+                             report: Callable[[str], None] = lambda msg: None) -> dict:
         """Stage-1 result-set merge + cross-encoder re-rank -> top-`candidate_pool` paper dicts
         (with abstracts). LLM-FREE. Lifted from the old LiteratureSearchTool so retrieval logic
         lives with the extractor, not in the agent-tool file."""
@@ -175,6 +181,7 @@ class ReactomeLiteratureExtractor:
             else:
                 name_query = f"({name_query}) OR {additional_terms}"
 
+        report("searching PubMed")
         pool = self._merge_search(name_query, context_query,
                                   name_fetch=max(1, fetch_papers // 2),
                                   context_fetch=fetch_papers)
@@ -184,6 +191,7 @@ class ReactomeLiteratureExtractor:
             before = len(pool)
             pool = [d for d in pool if str(d.get("uid")) not in avoid_pmids]
             logger.info(f"Excluded {before - len(pool)} avoid_pmids from the {before}-doc pool")
+        report(f"ranking {len(pool)} abstracts")
         ranked = self._rerank(gene, pool, candidate_pool, description, pathway_descs, placement=placement)
         return {
             "name_query": name_query,

@@ -14,6 +14,7 @@ from curator_llm.models.session import Issue, PaperInfo, Session, SessionSummary
 from curator_llm.models.usage import summarize
 from curator_llm.ports.auth import AuthError, AuthProvider, AuthUser, ForbiddenError
 from curator_llm.ports.jobs import JobRunner
+from curator_llm.ports.paper_finder import PaperFinder
 from curator_llm.ports.pipeline import PaperRef, Pipeline, PipelineInput
 from curator_llm.ports.sessions import SessionStore
 from curator_llm.services.network import build_network
@@ -36,6 +37,14 @@ class StartRequest(BaseModel):
     pmid: Optional[str] = None                       # one paper ...
     pmids: List[str] = Field(default_factory=list)   # ... or several: merged into ONE draft, across papers
     focus: Optional[str] = None
+
+
+class GeneSearchRequest(BaseModel):
+    gene: str
+    max_papers: int = 5
+
+
+_GENE = re.compile(r'[A-Z0-9][A-Z0-9.-]{0,24}')
 
 
 class IssueUpdate(BaseModel):
@@ -82,7 +91,8 @@ def _safe_name(name: str) -> str:
 def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: Optional[JobRunner] = None,
                pipeline: Optional[Pipeline] = None, resolver_factory=None,
                upload_dir: Optional[str] = None, cors_origins: Optional[List[str]] = None,
-               chat_model=None, events=None, qa_model=None, max_papers: int = MAX_PAPERS) -> FastAPI:
+               chat_model=None, events=None, qa_model=None, max_papers: int = MAX_PAPERS,
+               paper_finder: Optional[PaperFinder] = None) -> FastAPI:
     app = FastAPI(title='curator-tool-llm')
     if cors_origins:
         app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True,
@@ -120,6 +130,21 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                 PipelineInput(papers=[PaperRef(pmid=p) for p in pmids], focus=req.focus))
         sid, jid = svc().start(user.username, spec)
         return {'sessionId': sid, 'jobId': jid}
+
+    @router.post('/papers/by-gene', status_code=202)
+    def papers_by_gene(req: GeneSearchRequest, user: AuthUser = Depends(current_user)):
+        """Find the papers worth annotating a gene from: PubMed search, re-rank, then an LLM judge scoring each paper's
+        usefulness for a Reactome annotation. Takes a few minutes (PINK1: 4): poll GET /jobs/{jobId}; when done, its `result`
+        holds the papers, best first (a paper with no `pmcid` has no PMC full text, so it needs its PDF uploaded).
+        Annotate the chosen ones with POST /sessions {pmids, focus: gene}."""
+        if paper_finder is None:
+            raise HTTPException(503, 'gene search is not configured (GENE_SEARCH=1)')
+        gene = (req.gene or '').strip().upper()
+        if not _GENE.fullmatch(gene):
+            raise HTTPException(422, f'not a gene symbol: {req.gene!r}')
+        n = max(1, min(req.max_papers, max_papers))
+        jid = svc().jobs.submit(user.username, lambda report: paper_finder.find(gene, n, report).model_dump())
+        return {'jobId': jid}
 
     @router.post('/sessions/upload', status_code=202)
     async def upload(file: Optional[UploadFile] = File(None), files: Optional[List[UploadFile]] = File(None),
@@ -355,7 +380,8 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         j = svc().jobs.get(job_id, user.username)
         if j is None:
             raise HTTPException(404, 'no such job')
-        return {'id': j.id, 'status': j.status, 'progress': j.progress, 'error': j.error}
+        return {'id': j.id, 'status': j.status, 'progress': j.progress, 'error': j.error,
+                'result': j.result if j.status == 'done' else None}
 
     app.include_router(router)
     return app

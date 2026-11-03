@@ -24,6 +24,8 @@ Notes from measuring on PINK1 (Kane et al. 2014):
     think by default. Set off anyway, so the output stays the same if that default changes.
   * Haiku was not a safe duplicate judge (missed 10 of 24 merges).
   * claude-sonnet-5-5 turns thinking off with {"type": "between_tools"}, not "disabled" (see thinking_off).
+  * claude-sonnet-5-5 (and opus-5-5, fable-5-1, mythos-5-1) reject forced tool use (tool_choice "tool"/"any"), which is
+    how LangChain's with_structured_output works by default; use structured_output() (see there).
 """
 import os
 from dataclasses import dataclass
@@ -63,6 +65,23 @@ _BETWEEN_TOOLS = ('claude-sonnet-5-5',)
 
 def thinking_off(model: str) -> Dict[str, str]:
     return {'type': 'between_tools' if model.startswith(_BETWEEN_TOOLS) else 'disabled'}
+
+
+# Models that return 400 on tool_choice {"type": "tool"} / {"type": "any"}. LangChain's default
+# with_structured_output(method="function_calling") forces a tool call, so these use method="json_schema"
+# (Claude's structured outputs, output_config.format). Older models keep the tool-call method they were tested with.
+_NO_FORCED_TOOLS = ('claude-sonnet-5-5', 'claude-opus-5-5', 'claude-fable-5-1', 'claude-mythos-5-1')
+
+
+def structured_output_kwargs(model: str) -> Dict[str, str]:
+    """Extra keyword arguments for LangChain `with_structured_output` on this model."""
+    return {'method': 'json_schema'} if (model or '').startswith(_NO_FORCED_TOOLS) else {}
+
+
+def structured_output(chat_model: Any, schema: Any) -> Any:
+    """`chat_model.with_structured_output(schema)` with the method this model accepts.
+    A model without a `.model` name (a test fake) gets the plain call."""
+    return chat_model.with_structured_output(schema, **structured_output_kwargs(getattr(chat_model, 'model', '')))
 
 
 def spec(role: str) -> ModelSpec:

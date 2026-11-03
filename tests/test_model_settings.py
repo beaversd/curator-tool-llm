@@ -55,3 +55,20 @@ def test_qa_has_its_own_role_with_thinking_off_and_the_model_takes_it_from_there
     from curator_llm.adapters.chat_anthropic import AnthropicChatModel
     assert AnthropicChatModel(client=object(), role='qa').thinking == {'type': 'between_tools'}
     assert AnthropicChatModel(client=object()).thinking is None          # chat is unchanged
+
+
+def test_structured_output_avoids_forced_tool_use_where_rejected():
+    # sonnet-5-5 returns 400 on tool_choice "tool"/"any", which with_structured_output sends by default
+    assert ms.structured_output_kwargs('claude-sonnet-5-5') == {'method': 'json_schema'}
+    assert ms.structured_output_kwargs('claude-sonnet-4-6') == {}
+
+    class Fake:
+        def __init__(self, model=None):
+            if model:
+                self.model = model
+
+        def with_structured_output(self, schema, **kw):
+            return kw
+
+    assert ms.structured_output(Fake('claude-opus-5-5'), dict) == {'method': 'json_schema'}
+    assert ms.structured_output(Fake(), dict) == {}

@@ -81,3 +81,20 @@ class SyncJobRunner:
     def get(self, job_id, owner):
         job = self.jobs.get(job_id)
         return job if job and job.owner == owner else None
+
+
+class FakePaperFinder:
+    """Returns `papers` (CandidatePaper dicts) for any gene, or raises `fail` if given; records each call."""
+
+    def __init__(self, papers=None, fail: Optional[Exception] = None):
+        self.papers, self.fail, self.calls = papers or [], fail, []
+
+    def find(self, gene, max_papers=5, report=None):
+        from curator_llm.ports.paper_finder import GeneSearchResult
+        self.calls.append((gene, max_papers))
+        if report:
+            report('searching PubMed')
+        if self.fail:
+            raise self.fail
+        return GeneSearchResult(gene=gene, pool_size=120, candidate_pool=50,
+                                papers=self.papers[:max_papers])
