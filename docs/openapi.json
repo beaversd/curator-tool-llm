@@ -875,6 +875,44 @@
         }
       }
     },
+    "/api/llm/sessions/{session_id}/suggestions": {
+      "post": {
+        "summary": "Suggestions",
+        "description": "Make the suggested fixes for the draft as it is now and return the pending ones. They are proposals (actor\n'suggestions') like any other: nothing changes until one is accepted. A fix the curator already decided on is\nnot made again. They are also made when a session is created and after each accepted proposal.",
+        "operationId": "suggestions_api_llm_sessions__session_id__suggestions_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/llm/sessions/{session_id}/proposals/{proposal_id}/accept": {
       "post": {
         "summary": "Accept",
@@ -1213,7 +1251,8 @@
               "emitter",
               "pipeline",
               "existing",
-              "qa"
+              "qa",
+              "checks"
             ],
             "title": "Source"
           },
