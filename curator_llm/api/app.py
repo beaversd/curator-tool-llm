@@ -15,6 +15,7 @@ from curator_llm.models.usage import summarize
 from curator_llm.ports.auth import AuthError, AuthProvider, AuthUser, ForbiddenError
 from curator_llm.ports.jobs import JobRunner
 from curator_llm.ports.paper_finder import PaperFinder
+from curator_llm.ports.pathway_finder import PathwayFinder
 from curator_llm.ports.pipeline import PaperRef, Pipeline, PipelineInput
 from curator_llm.ports.sessions import SessionStore
 from curator_llm.services.network import build_network
@@ -42,6 +43,16 @@ class StartRequest(BaseModel):
 class GeneSearchRequest(BaseModel):
     gene: str
     max_papers: int = 5
+
+
+class GenePathwaysRequest(BaseModel):
+    gene: str
+    fi_cutoff: float = Field(0.8, ge=0, lt=1)          # lowest FI score for a partner
+    top_partners: int = Field(10, ge=1, le=50)         # partners used, best FI score first
+    fdr_cutoff: float = Field(0.05, gt=0, le=1)        # highest FDR for a predicted pathway
+    max_pathways: int = Field(8, ge=1, le=50)          # predicted pathways listed (the gene is not in them yet)
+    max_evidence: int = Field(5, ge=0, le=20)          # papers per pathway; 0 skips the literature lookup
+    summarize: bool = True                             # LLM summary of each predicted pathway's papers
 
 
 _GENE = re.compile(r'[A-Z0-9][A-Z0-9.-]{0,24}')
@@ -92,7 +103,8 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                pipeline: Optional[Pipeline] = None, resolver_factory=None,
                upload_dir: Optional[str] = None, cors_origins: Optional[List[str]] = None,
                chat_model=None, events=None, qa_model=None, max_papers: int = MAX_PAPERS,
-               paper_finder: Optional[PaperFinder] = None) -> FastAPI:
+               paper_finder: Optional[PaperFinder] = None,
+               pathway_finder: Optional[PathwayFinder] = None) -> FastAPI:
     app = FastAPI(title='curator-tool-llm')
     if cors_origins:
         app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True,
@@ -144,6 +156,24 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
             raise HTTPException(422, f'not a gene symbol: {req.gene!r}')
         n = max(1, min(req.max_papers, max_papers))
         jid = svc().jobs.submit(user.username, lambda report: paper_finder.find(gene, n, report).model_dump())
+        return {'jobId': jid}
+
+    @router.post('/pathways/by-gene', status_code=202)
+    def pathways_by_gene(req: GenePathwaysRequest, user: AuthUser = Depends(current_user)):
+        """Find the Reactome pathways a gene could be annotated in (the prediction is LLM-free): those enriched among its top
+        functional-interaction partners (binomial test, BH FDR) that the gene is not in yet, each with its literature
+        evidence (PubMed papers naming the gene with the pathway's partners or name terms, and the abstract sentences
+        that do) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n], plus the
+        released human pathways it is already in (Neo4j). Takes seconds to a minute or two: poll
+        GET /jobs/{jobId}; when done, its `result` holds them. A gene with no FI partner, or no significant pathway, is a `status`, not a failed job."""
+        if pathway_finder is None:
+            raise HTTPException(503, 'gene search is not configured (GENE_SEARCH=1)')
+        gene = (req.gene or '').strip().upper()
+        if not _GENE.fullmatch(gene):
+            raise HTTPException(422, f'not a gene symbol: {req.gene!r}')
+        jid = svc().jobs.submit(user.username, lambda report: pathway_finder.find(
+            gene, req.fi_cutoff, req.top_partners, req.fdr_cutoff, req.max_pathways, req.max_evidence,
+            req.summarize, report).model_dump())
         return {'jobId': jid}
 
     @router.post('/sessions/upload', status_code=202)

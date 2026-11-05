@@ -98,3 +98,20 @@ class FakePaperFinder:
             raise self.fail
         return GeneSearchResult(gene=gene, pool_size=120, candidate_pool=50,
                                 papers=self.papers[:max_papers])
+
+
+class FakePathwayFinder:
+    """Returns `result` (a GenePathwaysResult dict, gene filled in) for any gene, or raises `fail`; records each call."""
+
+    def __init__(self, result=None, fail: Optional[Exception] = None):
+        self.result, self.fail, self.calls = result or {}, fail, []
+
+    def find(self, gene, fi_cutoff=0.8, top_partners=10, fdr_cutoff=0.05, max_pathways=8, max_evidence=5,
+             summarize=True, report=None):
+        from curator_llm.ports.pathway_finder import GenePathwaysResult
+        self.calls.append((gene, fi_cutoff, top_partners, fdr_cutoff, max_pathways, max_evidence, summarize))
+        if report:
+            report('ranking its functional-interaction partners')
+        if self.fail:
+            raise self.fail
+        return GenePathwaysResult(**{**self.result, 'gene': gene})

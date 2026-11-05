@@ -115,6 +115,43 @@
         }
       }
     },
+    "/api/llm/pathways/by-gene": {
+      "post": {
+        "summary": "Pathways By Gene",
+        "description": "Find the Reactome pathways a gene could be annotated in (the prediction is LLM-free): those enriched among its top\nfunctional-interaction partners (binomial test, BH FDR) that the gene is not in yet, each with its literature\nevidence (PubMed papers naming the gene with the pathway's partners or name terms, and the abstract sentences\nthat do) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n], plus the\nreleased human pathways it is already in (Neo4j). Takes seconds to a minute or two: poll\nGET /jobs/{jobId}; when done, its `result` holds them. A gene with no FI partner, or no significant pathway, is a `status`, not a failed job.",
+        "operationId": "pathways_by_gene_api_llm_pathways_by_gene_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenePathwaysRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/llm/sessions/upload": {
       "post": {
         "summary": "Upload",
@@ -1203,6 +1240,59 @@
           "message"
         ],
         "title": "ChatRequest"
+      },
+      "GenePathwaysRequest": {
+        "properties": {
+          "gene": {
+            "type": "string",
+            "title": "Gene"
+          },
+          "fi_cutoff": {
+            "type": "number",
+            "exclusiveMaximum": 1.0,
+            "minimum": 0.0,
+            "title": "Fi Cutoff",
+            "default": 0.8
+          },
+          "top_partners": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Top Partners",
+            "default": 10
+          },
+          "fdr_cutoff": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Fdr Cutoff",
+            "default": 0.05
+          },
+          "max_pathways": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Max Pathways",
+            "default": 8
+          },
+          "max_evidence": {
+            "type": "integer",
+            "maximum": 20.0,
+            "minimum": 0.0,
+            "title": "Max Evidence",
+            "default": 5
+          },
+          "summarize": {
+            "type": "boolean",
+            "title": "Summarize",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "gene"
+        ],
+        "title": "GenePathwaysRequest"
       },
       "GeneSearchRequest": {
         "properties": {

@@ -11,7 +11,8 @@ Settings (.env is loaded):
   MAX_PAPERS       most papers in one session (default 10)
   PAPER_WORKERS    papers extracted at the same time within a session (default 2)
   LLM_REVIEW=1     also run the OpenAI cross-model review
-  GENE_SEARCH=1    enable POST /api/llm/papers/by-gene (gene -> papers to annotate). Runs run_paper_search.py under
+  GENE_SEARCH=1    enable POST /api/llm/papers/by-gene (gene -> papers to annotate) and POST /api/llm/pathways/by-gene
+                   (gene -> Reactome pathways, for Gene2Path). They run run_paper_search.py / run_pathway_search.py under
                    GENE_SEARCH_PYTHON (default: this interpreter), which needs the full requirements.txt
 plus the existing ANTHROPIC_API_KEY, REACTOME_NEO4J_* and PUBMED_MONGO_URI.
 """
@@ -37,10 +38,11 @@ def build_app():
         store = InMemorySessionStore()
     pipeline, inner = build_pipeline()
     lookup, uniprot, ols = inner.lookup, inner.uniprot, inner.ontology
-    finder = None
+    finder = pathways = None
     if os.getenv('GENE_SEARCH', '0') == '1':
         from curator_llm.adapters.paper_finder_subprocess import SubprocessPaperFinder
-        finder = SubprocessPaperFinder()
+        from curator_llm.adapters.pathway_finder_subprocess import SubprocessPathwayFinder
+        finder, pathways = SubprocessPaperFinder(), SubprocessPathwayFinder()
     origins = [o.strip() for o in os.getenv('CORS_ORIGINS', 'http://localhost:4200').split(',') if o.strip()]
     return create_app(WsAuthProvider(os.getenv('WS_BASE_URL', 'http://localhost:9090')),
                       store, InProcessJobRunner(), pipeline,
@@ -48,7 +50,7 @@ def build_app():
                       upload_dir=os.getenv('UPLOAD_DIR', os.path.join(ROOT, 'data', 'uploads')),
                       cors_origins=origins, chat_model=AnthropicChatModel(),
                       qa_model=AnthropicChatModel(role='qa'), max_papers=int(os.getenv('MAX_PAPERS', '10')),
-                      paper_finder=finder)
+                      paper_finder=finder, pathway_finder=pathways)
 
 
 app = build_app() if os.getenv('CURATOR_LLM_AUTOSTART', '1') == '1' else None

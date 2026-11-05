@@ -47,6 +47,7 @@ DEFAULTS: Dict[str, ModelSpec] = {
     'draft':       ModelSpec('claude-sonnet-5-5', thinking=False),   # services/draft_builder.py (LangChain)
     'chat':        ModelSpec('claude-sonnet-5-5'),                 # chat agent
     'qa':          ModelSpec('claude-sonnet-5-5', thinking=False),  # per-reaction QA review (one short JSON reply)
+    'pathway_summary': ModelSpec('claude-sonnet-5-5', thinking=False),  # run_pathway_search.py: Gene2Path literature summary per pathway
     # --- gene-first pipeline (run_curator.py, LangChain) ---
     'gene':        ModelSpec('claude-sonnet-4-6', temperature=1.0),  # curator, reviewer, QA
     'convert':     ModelSpec('claude-sonnet-4-6', temperature=0.1),  # reaction_to_instances.py
