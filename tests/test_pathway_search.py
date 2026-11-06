@@ -172,11 +172,12 @@ def test_adapter_uses_the_gene_search_python(monkeypatch):
 @pytest.fixture
 def script(monkeypatch):
     """run_pathway_search with its Neo4j, FI, enrichment and PubMed lookups faked. state['papers'] is
-    {pmid: {title, journal, year, abstract}}; every evidence search returns all of them, in that order.
+    {pmid: {title, journal, year, abstract}}; every evidence search returns all of them, in that order; a partner
+    search returns state['partner_hits'][partner] (none by default) and fails for partners in state['partner_fails'].
     The summary model is a FakeSummaryModel: state['prompts'] holds what it was asked, state['reply'] what it says."""
     import run_pathway_search as rps
     state = {'annotated': [], 'placement': ({'status': 'ok', 'partners_used': []}, False), 'enriched': [],
-             'papers': {}, 'queries': [], 'prompts': [], 'reply': 'A summary.'}
+             'papers': {}, 'queries': [], 'partner_queries': [], 'prompts': [], 'reply': 'A summary.'}
     monkeypatch.setattr(rps, 'summary_model', lambda: FakeSummaryModel(state))
 
     def pubmed_search(query):
@@ -185,6 +186,14 @@ def script(monkeypatch):
             raise RuntimeError('esearch 429')
         return len(state['papers']) * 10, list(state['papers'])
     monkeypatch.setattr(rps, 'pubmed_search', pubmed_search)
+
+    def partner_search(gene, partner):
+        state['partner_queries'].append((gene, partner))
+        if partner in state.get('partner_fails', ()):
+            raise RuntimeError('esearch 429')
+        pmids = state.get('partner_hits', {}).get(partner, [])
+        return len(pmids) * 10, pmids
+    monkeypatch.setattr(rps, 'partner_search', partner_search)
     monkeypatch.setattr(rps, 'pubmed_articles', lambda pmids: {p: state['papers'][p] for p in pmids})
     monkeypatch.setattr(rps, 'pmc_ids', lambda pmids: {p: 'PMC' + p for p in pmids if p == '1'})
     monkeypatch.setattr(rps, 'annotated_pathways', lambda gene: state['annotated'])
@@ -276,6 +285,16 @@ def test_evidence_query_needs_the_gene_and_any_partner_or_every_word_of_a_term_g
     assert rps.evidence_query('PINK1', [], []) == '"PINK1"[tiab]'
 
 
+def test_abstracts_lose_a_trailing_abbreviation_list(monkeypatch):
+    import run_pathway_search as rps
+    xml = b'''<PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>1</PMID><Article><ArticleTitle>T</ArticleTitle>
+      <Abstract><AbstractText>PINK1 acts in joints.Abbreviations: MFN2: mitofusin 2; OPA1: OPA1 mitochondrial dynamin
+      </AbstractText></Abstract></Article></MedlineCitation></PubmedArticle></PubmedArticleSet>'''
+    monkeypatch.setattr(rps, '_ncbi_params', lambda **kw: kw)
+    monkeypatch.setattr(rps.requests, 'get', lambda *a, **kw: type('R', (), {'content': xml, 'raise_for_status': lambda s: None})())
+    assert rps.pubmed_articles(['1'])['1']['abstract'] == 'PINK1 acts in joints.'
+
+
 def test_supporting_sentences_name_the_gene_with_a_partner_or_term_most_first():
     import run_pathway_search as rps
     abstract = ('Mitochondria move along microtubules. PINK1 is a kinase. PINK1 binds Miro in mitophagy. '
@@ -323,7 +342,43 @@ def test_max_evidence_0_skips_the_literature(script):
     state['placement'] = predicted()
     state['enriched'] = enriched('Mitophagy')
     p = rps.search('PINK1', max_evidence=0)['predicted_pathways'][0]
-    assert state['queries'] == [] and 'evidence' not in p
+    assert state['queries'] == [] and state['partner_queries'] == [] and 'evidence' not in p
+    assert 'partner_evidence' not in p
+
+
+def test_each_partner_gets_its_own_papers_those_tying_it_to_the_gene_first(script, monkeypatch):
+    rps, state = script
+    monkeypatch.setattr(rps, 'PARTNER_PAPERS', 2)
+    state['placement'] = predicted()
+    state['enriched'] = [{'pathway_id': 7, 'pathway_name': 'RHOT1 GTPase cycle', 'fdr': 1e-4, 'overlap_count': 3,
+                          'mapped_genes': ['RHOT1', 'RHOT2', 'TRAK1']}]
+    state['papers'] = {
+        '1': {'title': 'PINK1 and Miro', 'journal': 'Cell', 'year': '2011',
+              'abstract': 'Here PINK1 phosphorylates RHOT1. RHOT2 is degraded too, with PINK1.'},
+        '4': {'title': 'PINK1 and RHOT1 in flies', 'journal': 'J', 'year': '2016', 'abstract': 'Nothing more.'},
+        '5': {'title': 'RHOT1 review', 'journal': 'R', 'year': '2019', 'abstract': 'PINK1 and RHOT1 bind.'},
+        '6': {'title': 'Other', 'journal': 'R', 'year': '2019', 'abstract': 'PINK1 binds RHOT1.'}}
+    state['partner_hits'] = {'RHOT1': ['4', '5', '1', '6'], 'RHOT2': ['1']}
+    state['partner_fails'] = {'TRAK1'}
+    p = rps.search('PINK1')['predicted_pathways'][0]
+    assert state['partner_queries'] == [('PINK1', 'RHOT1'), ('PINK1', 'RHOT2'), ('PINK1', 'TRAK1')]
+    rhot1, rhot2, trak1 = p['partner_evidence']
+    assert rhot1['partner'] == 'RHOT1' and rhot1['count'] == 40
+    assert [e['pmid'] for e in rhot1['papers']] == ['5', '1']        # with a sentence first, then relevance; capped
+    assert rhot1['papers'][0]['sentences'] == ['PINK1 and RHOT1 bind.'] and rhot1['papers'][1]['pmcid'] == 'PMC1'
+    assert rhot2['papers'][0]['sentences'] == ['RHOT2 is degraded too, with PINK1.']
+    assert trak1 == {'partner': 'TRAK1', 'count': 0, 'papers': [], 'error': 'RuntimeError: esearch 429'}
+    from curator_llm.ports.pathway_finder import GenePathwaysResult
+    assert GenePathwaysResult.model_validate(rps.search('PINK1')).predicted_pathways[0].partner_evidence[2].error
+
+
+def test_partner_evidence_is_searched_even_when_the_pathway_search_fails(script):
+    rps, state = script
+    state['placement'] = predicted()
+    state['enriched'] = enriched('Mitophagy')
+    state['search_fails'] = True
+    p = rps.search('PINK1')['predicted_pathways'][0]
+    assert p['evidence_error'] and [pe['partner'] for pe in p['partner_evidence']] == ['A', 'B']
 
 
 # ── summaries ─────────────────────────────────────────────────────────────

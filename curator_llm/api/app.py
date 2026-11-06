@@ -163,7 +163,7 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         """Find the Reactome pathways a gene could be annotated in (the prediction is LLM-free): those enriched among its top
         functional-interaction partners (binomial test, BH FDR) that the gene is not in yet, each with its literature
         evidence (PubMed papers naming the gene with the pathway's partners or name terms, and the abstract sentences
-        that do) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n], plus the
+        that do; and `partner_evidence`, the papers naming the gene with each partner on its own) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n], plus the
         released human pathways it is already in (Neo4j). Takes seconds to a minute or two: poll
         GET /jobs/{jobId}; when done, its `result` holds them. A gene with no FI partner, or no significant pathway, is a `status`, not a failed job."""
         if pathway_finder is None:

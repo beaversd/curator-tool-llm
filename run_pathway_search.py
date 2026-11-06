@@ -1,7 +1,8 @@
 """Gene -> Reactome pathways: the released human pathways the gene is already annotated in (Neo4j), and the
 pathways it is NOT yet in that are enriched among its top functional-interaction partners (FI scores from Mongo; binomial
 test, BH FDR), each with its literature evidence: PubMed papers that mention the gene together with the pathway's partners
-or the key words of its name, and the abstract sentences that do. The prediction itself is LLM-free; the only LLM step is
+or the key words of its name, and the abstract sentences that do; and, per partner in the pathway, the papers naming
+the gene with that partner (one PubMed search each), so every partner shows its own evidence or the lack of it. The prediction itself is LLM-free; the only LLM step is
 an optional summary per predicted pathway (role 'pathway_summary'), written from that pathway's papers alone and citing
 them as [PMID:n], so the curator can read what the literature says before opening the papers. The prediction is the gene-first pipeline's own
 placement (ReactomeUtils.suggest_pathway_placement), so `confident` means what it means there. Used by Gene2Path in
@@ -31,6 +32,8 @@ import requests
 ESEARCH_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi'
 EFETCH_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
 SEARCH_POOL = 20          # papers fetched per pathway, before ranking them here
+PARTNER_POOL = 10         # papers fetched per partner of a pathway, before ranking them here
+PARTNER_PAPERS = 3        # papers listed per partner
 SUMMARY_WORKERS = 4       # pathway summaries written at the same time
 # Words of a pathway name that say nothing about what it is about, left out of its literature search.
 GENERIC_WORDS = {'signaling', 'signalling', 'pathway', 'pathways', 'regulation', 'regulates', 'regulated', 'mediated',
@@ -117,6 +120,11 @@ def pubmed_search(query, retmax=SEARCH_POOL):
     return int(res.get('count') or 0), [str(p) for p in res.get('idlist') or []]
 
 
+# Some journals (Autophagy) end the abstract with a list of abbreviations naming nearly every gene, glued to the last
+# sentence ("...diseases.Abbreviations: ACTB: actin, beta; ..."): it would make a review co-mention every partner.
+_ABBREVIATIONS = re.compile(r'\s*\bAbbreviations?\s*:.*\Z', re.S)
+
+
 def pubmed_articles(pmids):
     """{pmid: {title, journal, year, abstract}}, in one efetch."""
     if not pmids:
@@ -129,7 +137,7 @@ def pubmed_articles(pmids):
         pmid = text('MedlineCitation/PMID')
         year = text('.//Journal/JournalIssue/PubDate/Year') or text('.//Journal/JournalIssue/PubDate/MedlineDate')[:4]
         out[pmid] = {'title': text('.//Article/ArticleTitle'), 'journal': text('.//Article/Journal/Title'),
-                     'year': year, 'abstract': text('.//Article/Abstract/AbstractText')}
+                     'year': year, 'abstract': _ABBREVIATIONS.sub('', text('.//Article/Abstract/AbstractText'))}
     return out
 
 
@@ -151,7 +159,8 @@ def supporting_sentences(abstract, gene, partners, terms, n=2):
 
 def pathway_evidence(gene, pathway, max_papers):
     """The literature for one predicted pathway: (papers, total PubMed hits, {pmid: abstract} of the papers listed, for
-    the summary; the abstracts are not part of the result). Each paper says which of the pathway's
+    the summary; the abstracts are not part of the result; {pmid: article} of every paper fetched, reused by
+    partner_evidence). Each paper says which of the pathway's
     partners (its FI partners in the pathway) and name terms it mentions, and quotes the sentences that tie them to the
     gene. Papers co-mentioning more partners rank first, then more terms, then PubMed relevance."""
     partners = pathway['mapped_genes']
@@ -172,7 +181,44 @@ def pathway_evidence(gene, pathway, max_papers):
     papers.sort(key=lambda rp: (-len(rp[1]['partners_mentioned']), -len(rp[1]['terms_mentioned']),
                                 -len(rp[1]['sentences']), rp[0]))
     listed = [p for _, p in papers[:max_papers]]
-    return listed, total, {p['pmid']: articles[p['pmid']]['abstract'] for p in listed}
+    return listed, total, {p['pmid']: articles[p['pmid']]['abstract'] for p in listed}, articles
+
+
+def partner_search(gene, partner):
+    """(total hits, PMIDs by PubMed relevance) for papers naming the gene and one partner in title/abstract."""
+    return pubmed_search(f'"{gene}"[tiab] AND "{partner}"[tiab]', retmax=PARTNER_POOL)
+
+
+def partner_evidence(gene, partners, articles):
+    """For each partner, in the order given: the papers naming the gene with it, those with a sentence tying the two
+    first, then PubMed relevance; at most PARTNER_PAPERS. `articles` ({pmid: article}) is reused and filled in with
+    the papers fetched here (one efetch over all the partners). A failed search is that partner's `error`."""
+    found = {}
+    for partner in partners:
+        try:
+            found[partner] = partner_search(gene, partner)
+        except Exception as e:
+            found[partner] = e
+    missing = sorted({pmid for f in found.values() if not isinstance(f, Exception) for pmid in f[1]} - set(articles))
+    articles.update(pubmed_articles(missing))
+    out = []
+    for partner in partners:
+        f = found[partner]
+        if isinstance(f, Exception):
+            out.append({'partner': partner, 'count': 0, 'papers': [], 'error': f'{type(f).__name__}: {f}'})
+            continue
+        total, pmids = f
+        papers = []
+        for rank, pmid in enumerate(pmids):
+            a = articles.get(pmid)
+            if a:
+                sentences = supporting_sentences(a['abstract'], gene, [partner], [])
+                papers.append((not sentences, rank, {'pmid': pmid, 'title': a['title'], 'journal': a['journal'],
+                                                     'year': a['year'], 'partners_mentioned': [partner],
+                                                     'terms_mentioned': [], 'sentences': sentences}))
+        out.append({'partner': partner, 'count': total,
+                    'papers': [p for *_, p in sorted(papers, key=lambda x: x[:2])[:PARTNER_PAPERS]]})
+    return out
 
 
 def pmc_ids(pmids):
@@ -186,18 +232,25 @@ def pmc_ids(pmids):
 
 
 def add_evidence(gene, pathways, max_papers):
-    """Fill in each pathway's `evidence`, `evidence_count` and, when its lookup failed, `evidence_error` (in place).
-    Returns {pmid: abstract} over all the papers listed, for add_summaries."""
+    """Fill in each pathway's `evidence`, `evidence_count`, `partner_evidence` and, when a lookup failed,
+    `evidence_error` / `partner_evidence_error` (in place). Returns {pmid: abstract} over the pathway-level papers
+    listed, for add_summaries."""
     abstracts = {}
     for p in pathways:
         progress(f"finding the literature for {p['pathway_name']}")
+        articles = {}
         try:
-            p['evidence'], p['evidence_count'], found = pathway_evidence(gene, p, max_papers)
+            p['evidence'], p['evidence_count'], found, articles = pathway_evidence(gene, p, max_papers)
             abstracts.update(found)
         except Exception as e:
             p['evidence'], p['evidence_count'], p['evidence_error'] = [], 0, f'{type(e).__name__}: {e}'
-    pmc = pmc_ids(sorted({e['pmid'] for p in pathways for e in p['evidence']}))
-    for e in (e for p in pathways for e in p['evidence']):
+        try:
+            p['partner_evidence'] = partner_evidence(gene, p['mapped_genes'], articles)
+        except Exception as e:
+            p['partner_evidence'], p['partner_evidence_error'] = [], f'{type(e).__name__}: {e}'
+    papers = [e for p in pathways for e in p['evidence'] + [e for pe in p['partner_evidence'] for e in pe['papers']]]
+    pmc = pmc_ids(sorted({e['pmid'] for e in papers}))
+    for e in papers:
         e['pmcid'] = pmc.get(e['pmid'])
     return abstracts
 
@@ -320,6 +373,9 @@ def main(argv=None):
         for e in p.get('evidence') or []:
             print(f"      {e['pmid']:<10} {', '.join(e['partners_mentioned'] + e['terms_mentioned'])}  "
                   f"{e['title'][:70]}", flush=True)
+        for pe in p.get('partner_evidence') or []:
+            print(f"      {pe['partner']:<10} {pe.get('error') or str(pe['count']) + ' papers'}  "
+                  f"{' '.join(e['pmid'] for e in pe['papers'])}", flush=True)
 
 
 if __name__ == '__main__':

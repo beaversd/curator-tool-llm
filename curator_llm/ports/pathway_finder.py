@@ -27,6 +27,14 @@ class PathwayEvidence(BaseModel):
     sentences: List[str] = Field(default_factory=list)  # abstract sentences naming the gene with a partner/term
 
 
+class PartnerEvidence(BaseModel):
+    """The papers naming the gene with one of a predicted pathway's partners (PubMed: gene AND partner, title/abstract)."""
+    partner: str
+    count: int = 0                              # PubMed hits; `papers` holds the best few
+    papers: List[PathwayEvidence] = Field(default_factory=list)   # a sentence tying the two first, then relevance
+    error: Optional[str] = None                 # the search failed for this partner
+
+
 class PredictedPathway(BaseModel):
     """A pathway the gene is not annotated in yet, enriched among its top FI partners (binomial test,
     Benjamini-Hochberg FDR), with the literature that links the gene to it."""
@@ -39,6 +47,8 @@ class PredictedPathway(BaseModel):
     evidence: List[PathwayEvidence] = Field(default_factory=list)  # best first
     evidence_count: int = 0                     # PubMed hits for the evidence query (evidence holds the top few)
     evidence_error: Optional[str] = None        # the literature lookup failed for this pathway
+    partner_evidence: List[PartnerEvidence] = Field(default_factory=list)  # one per mapped_genes partner, same order
+    partner_evidence_error: Optional[str] = None
     # LLM summary of what `evidence` says about the gene in this pathway, citing it as [PMID:n]. None when the pathway
     # has no papers, or the search ran without summaries; summary_error says why one could not be written.
     summary: Optional[str] = None
