@@ -426,6 +426,29 @@ What is found is only offered; the curator keeps, edits or clears it:
   "Find in PubMed" (`POST /sessions/{id}/papers/identify`, on the stored PDF). Saving (`PUT /sessions/{id}/papers/pmid`,
   `{source, pmid}`; empty removes it) updates the reactions from that PDF and clears the `paper_no_pmid` issue.
 
+### Compartments, from the paper
+
+In Reactome every physical entity sits in a compartment and every reaction lists the compartments it happens in. Papers
+rarely say so in a field the extraction can fill (2 of 285 participants on four test papers), so after identifiers are
+resolved one more step (`services/compartments.py`) places each participant **in each reaction**, from what the text
+says. Code first finds the candidate passages: the sentences that name the participant (by its name, the paper's name,
+UniProt synonyms or Reactome's names) together with a location word, ranked for the reaction. The model then only decides
+which of those passages place it, and where; the passage is the recorded quote, and a participant with no passage is
+never placed. Example: "beta-catenin accumulates in the cytoplasm before translocating to the nucleus where
+it partners with TCF/LEF" puts beta-catenin in the nucleoplasm for that binding. Rules:
+
+- Evidence only. Each placement is *stated* (the text says or clearly implies it) or *shown* (an experiment places it),
+  with the passage it comes from. Without evidence nothing is set; a likely compartment from general knowledge is
+  offered as a suggested fix the curator can accept (it then counts as the curator's assertion), never applied.
+- A reaction can span compartments (a membrane receptor and a cytosolic partner, a translocation).
+- One molecule placed in different compartments in different reactions becomes separate entities, as in Reactome: the
+  reaction that places it elsewhere uses an existing participant of that molecule there ("CTNNB1 nuclear"), or a new one.
+- Reactome supplies only the names (its compartments in real use); the existing Reactome instance of a placed molecule is
+  then reused (by display name, else accession + compartment).
+
+On by default; `COMPARTMENTS=0` turns it off. About $0.1-0.2 per paper (only the passages are sent). The reaction panel
+shows each participant's compartment, how it was found and the passage.
+
 ### Checks on every draft
 
 Every draft is checked before a curator sees it, and what the checks find is listed as issues; nothing is removed or

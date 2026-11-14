@@ -13,7 +13,7 @@ from curator_llm.models.reactome import ReactomeDraft
 @dataclass
 class Suggestion:
     reaction_key: str
-    code: str               # the kind of fix: 'enzyme_as_input' | 'missing_pmids' | 'remove_reaction'
+    code: str               # the kind of fix: 'enzyme_as_input' | 'missing_pmids' | 'remove_reaction' | 'compartment'
     reason: str
     ops: List[dict]         # RFC 6902 patch against the draft
 
@@ -91,6 +91,30 @@ def _unsupported(draft: ReactomeDraft, evidence: Dict[str, Evidence], reviews: C
     return out
 
 
+def _compartments(draft: ReactomeDraft, gone: set) -> List[Suggestion]:
+    """A participant the paper does not place, with a compartment suggested from general knowledge
+    (services/compartments.py): place it there. Accepting makes it the curator's assertion (source 'curator')."""
+    out = []
+    users: Dict[str, List[str]] = {}
+    for r in draft.reactions:
+        for k in r.inputs + r.outputs + ([r.catalyst.entity] if r.catalyst else []) + [g.regulator for g in r.regulations]:
+            users.setdefault(k, []).append(r.key)
+    for k, p in draft.participants.items():
+        c = p.compartment_suggested
+        rs = [r for r in users.get(k, []) if r not in gone]
+        if p.compartment is not None or c is None or not rs:
+            continue
+        base = f'/participants/{k}'
+        out.append(Suggestion(rs[0], 'compartment',
+                              f'place {p.name} in {c.display_name} (suggested from general knowledge: the paper does not '
+                              'say where it is; accepting makes it your assertion)',
+                              [{'op': 'replace', 'path': f'{base}/compartment', 'value': c.model_dump(mode='json')},
+                               {'op': 'replace', 'path': f'{base}/compartment_name', 'value': c.display_name},
+                               {'op': 'replace', 'path': f'{base}/compartment_source', 'value': 'curator'},
+                               {'op': 'replace', 'path': f'{base}/compartment_suggested', 'value': None}]))
+    return out
+
+
 def suggest_fixes(draft: ReactomeDraft, evidence: List[Evidence], reviews: Collection[str] = (),
                   issues: Iterable = ()) -> List[Suggestion]:
     """`reviews`: source tags of the papers that are review articles (their cited statements are evidence). `issues`: the
@@ -98,4 +122,5 @@ def suggest_fixes(draft: ReactomeDraft, evidence: List[Evidence], reviews: Colle
     by_id = {e.id: e for e in evidence}
     removed = _unsupported(draft, by_id, reviews, list(issues))
     gone = {s.reaction_key for s in removed}               # no point fixing the inputs of a reaction to be removed
-    return removed + [s for s in _enzyme_as_input(draft) + _missing_pmids(draft, by_id) if s.reaction_key not in gone]
+    return (removed + [s for s in _enzyme_as_input(draft) + _missing_pmids(draft, by_id) if s.reaction_key not in gone]
+            + _compartments(draft, gone))

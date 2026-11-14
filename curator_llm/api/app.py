@@ -125,8 +125,9 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                pipeline: Optional[Pipeline] = None, resolver_factory=None,
                upload_dir: Optional[str] = None, cors_origins: Optional[List[str]] = None,
                chat_model=None, events=None, qa_model=None, max_papers: int = MAX_PAPERS,
-               auto_qa: bool = False, article_search=None) -> FastAPI:
-    """`article_search` (ports.external.ArticleSearch, PubMed) finds the PubMed ID of an uploaded PDF and checks one a
+               auto_qa: bool = False, article_search=None, graph=None) -> FastAPI:
+    """`graph` (ports.graph.ReactomeGraph) gives the chat read-only Reactome lookups; without it the chat has none.
+    `article_search` (ports.external.ArticleSearch, PubMed) finds the PubMed ID of an uploaded PDF and checks one a
     curator types; without it, PDFs simply have none until a curator gives it."""
     app = FastAPI(title='curator-tool-llm')
     if cors_origins:
@@ -532,7 +533,7 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         s = load(session_id, user)
         if s.status != 'ready':
             raise HTTPException(409, f'session is {s.status}; chat needs a ready session')
-        agent = ChatAgent(svc(), chat_model)
+        agent = ChatAgent(svc(), chat_model, graph=graph)
         events = agent.run(user.username, session_id, body.message, body.selectedDbIds)
 
         def sse():

@@ -14,7 +14,7 @@ class Issue(BaseModel):
     """Something a curator must look at. Every note the pipeline produces becomes one of these, so the
     frontend can list them all in one place instead of burying them in logs."""
     id: str = ''
-    source: Literal['evidence', 'builder', 'resolver', 'emitter', 'pipeline', 'existing', 'qa', 'checks']
+    source: Literal['evidence', 'builder', 'resolver', 'emitter', 'pipeline', 'existing', 'qa', 'checks', 'compartments']
     severity: Literal['info', 'warning', 'action'] = 'warning'
     code: str                                  # stable machine-readable kind, e.g. 'needs_resolution:uniprot'
     message: str

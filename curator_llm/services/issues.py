@@ -188,6 +188,12 @@ def organize(issues: List[Issue], draft: Optional[ReactomeDraft], proposals: Ite
                 fix[(parts[1], 'qa_catalyst_is_consumed')] = p.id
             elif op.get('op') == 'replace' and len(parts) == 3 and parts[0] == 'reactions' and parts[2] == 'pmids':
                 fix[(parts[1], 'qa_no_literature_reference')] = p.id
+            elif op.get('op') == 'replace' and len(parts) == 3 and parts[0] == 'participants' and parts[2] == 'compartment':
+                fix[('participant', parts[1], 'compartment_not_in_paper')] = p.id
     for i in issues:
-        i.proposal_id = (fix.get((i.reaction_key, 'keep')) if i.category == 'keep'
-                         else fix.get((i.reaction_key, i.code))) if i.reaction_key else None
+        if i.reaction_key:
+            i.proposal_id = fix.get((i.reaction_key, 'keep')) if i.category == 'keep' else fix.get((i.reaction_key, i.code))
+        elif i.participant_key:
+            i.proposal_id = fix.get(('participant', i.participant_key, i.code))
+        else:
+            i.proposal_id = None

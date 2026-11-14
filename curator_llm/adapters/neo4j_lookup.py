@@ -117,6 +117,26 @@ class Neo4jInstanceLookup:
                     'RETURN DISTINCT n.identifier AS id', species=species, n=n)}
         return next(iter(ids)) if len(ids) == 1 else None
 
+    def find_unmodified_entity(self, identifier: str, compartment_db_id: int) -> List[Dict]:
+        """The physical entities (protein, gene, RNA or small molecule) whose reference has this identifier (UniProt
+        accession, ChEBI number, Ensembl id), in this compartment, without modified residues. Several: the caller does
+        not guess."""
+        if not identifier:
+            return []
+        return self._run('MATCH (r:ReferenceEntity {identifier: $i})<-[:referenceEntity]-(n:PhysicalEntity)'
+                         '-[:compartment]->(:Compartment {dbId: $c}) WHERE NOT (n)-[:hasModifiedResidue]->() '
+                         f'WITH DISTINCT n {_RETURN} LIMIT 5', i=str(identifier), c=int(compartment_db_id))
+
+    def compartments(self, min_uses: int = 50) -> List[Dict]:
+        """Reactome's compartments in real use (on at least `min_uses` physical entities), most used first:
+        [{dbId, displayName, schemaClassName, uses}]. The vocabulary services/compartments.py maps answers onto."""
+        with self.driver.session(database=self.database) as s:
+            rows = [dict(r) for r in s.run(
+                'MATCH (c:Compartment) OPTIONAL MATCH (e:PhysicalEntity)-[:compartment]->(c) '
+                'WITH c, count(e) AS uses WHERE uses >= $m '
+                'RETURN c.dbId AS dbId, c.displayName AS displayName, uses ORDER BY uses DESC', m=int(min_uses))]
+        return [{**r, 'schemaClassName': 'Compartment'} for r in rows]
+
     def find_species(self, name: str) -> Optional[Dict]:
         """The Species whose name or synonym is `name`, ignoring case ("KSHV", "HHV8" and "Human herpesvirus 8" are
         one), with its NCBI taxId: {dbId, displayName, schemaClassName, taxId}. None when there is not exactly one."""
@@ -202,3 +222,151 @@ def candidate_events(self, catalyst_accessions, participant_accessions, limit: i
 
 Neo4jInstanceLookup.events_citing = events_citing
 Neo4jInstanceLookup.candidate_events = candidate_events
+
+
+# ── read-only browsing for the chat agent (ReactomeGraph port, ports/graph.py) ─────────────────────
+_KIND_LABEL = {'pathway': 'Pathway', 'reaction': 'ReactionLikeEvent', 'protein': 'EntityWithAccessionedSequence',
+               'complex': 'Complex', 'set': 'EntitySet', 'small_molecule': 'SimpleEntity', 'drug': 'Drug',
+               'any': 'DatabaseObject'}
+_ID = 'n.dbId AS dbId, n.stId AS stId, n.displayName AS displayName, n.schemaClass AS schemaClass'
+_NAMED = '{dbId: x.dbId, name: x.displayName}'
+
+
+# a prefix names the reference database (a bare number can be a ChEBI, Guide to Pharmacology or PubChem id)
+_DB_PREFIX = {'chebi': 'ChEBI', 'gtop': 'Guide to Pharmacology', 'iuphar': 'Guide to Pharmacology',
+              'guidetopharmacology': 'Guide to Pharmacology', 'pubchem': 'PubChem', 'ensembl': 'ENSEMBL',
+              'uniprot': 'UniProt', 'mirbase': 'miRBase', 'ncbigene': 'NCBI Gene', 'kegg': 'KEGG'}
+# the reference's database: its databaseName, else its referenceDatabase (most UniProt entries carry only the latter)
+_REF_DB = 'coalesce(x.databaseName, [(x)-[:referenceDatabase]->(d) | d.displayName][0])'
+_REF_WHERE = f'x.identifier = $acc AND ($db IS NULL OR toLower({_REF_DB}) STARTS WITH toLower($db))'
+
+
+def _ref_id(identifier: str) -> str:
+    """'CHEBI:15422' -> '15422', 'GtoP:8708' -> '8708' (Reactome stores ids without the prefix); others unchanged."""
+    return _ref_parts(identifier)[0]
+
+
+def _ref_parts(identifier: str):
+    """(identifier without a known prefix, the database it names or None)."""
+    s = (identifier or '').strip()
+    head, sep, rest = s.partition(':')
+    db = _DB_PREFIX.get(re.sub(r'[^a-z]', '', head.lower())) if sep else None
+    return (rest.strip(), db) if db else (s, None)
+
+
+def _clean(d: Dict) -> Dict:
+    return {k: v for k, v in d.items() if v not in (None, [], '')}
+
+
+def search_reactome(self, text: str, kind: str = 'any', species: str = 'Homo sapiens', limit: int = 15) -> List[Dict]:
+    label = _KIND_LABEL.get(kind)
+    if label is None:
+        raise ValueError(f'kind must be one of {sorted(_KIND_LABEL)}')
+    where = 'toLower(n.displayName) CONTAINS toLower($t)'
+    if kind == 'any':
+        where += ' AND (n:Event OR n:PhysicalEntity)'
+    if species:
+        where += ' AND (n.speciesName IS NULL OR n.speciesName = $sp)'
+    q = (f'MATCH (n:`{label}`) WHERE {where} '
+         f'WITH n, toLower(n.displayName) AS low, toLower($t) AS t '
+         f'RETURN {_ID}, n.speciesName AS species '
+         # the name itself, then a name starting with it ("PINK1 [cytosol]"), then a word in it, then anything
+         'ORDER BY CASE WHEN low = t THEN 0 WHEN low STARTS WITH t THEN 1 '
+         "WHEN (' ' + low) CONTAINS (' ' + t) OR low CONTAINS ('-' + t) OR low CONTAINS (':' + t) THEN 2 ELSE 3 END, "
+         'size(n.displayName) LIMIT $limit')
+    with self.driver.session(database=self.database) as s:
+        rows = [_clean({k: r[k] for k in ('dbId', 'stId', 'displayName', 'schemaClass', 'species')})
+                for r in s.run(q, t=text.strip(), sp=species, limit=int(min(limit, 50)) + 10)]
+    return [r for r in rows if not _DEPRECATED.search(r.get('displayName', ''))][:limit]
+
+
+_INSTANCE = f"""
+MATCH (n:DatabaseObject) WHERE n.dbId = $id OR n.stId = $st
+WITH n LIMIT 1
+RETURN {_ID}, n.speciesName AS species,
+  [(n)-[:compartment]->(x) | x.displayName] AS compartments,
+  [(n)-[:input]->(x) | {_NAMED}] AS inputs,
+  [(n)-[:output]->(x) | {_NAMED}] AS outputs,
+  [(n)-[:catalystActivity]->(:CatalystActivity)-[:physicalEntity]->(x) | {_NAMED}] AS catalysts,
+  [(n)-[:regulatedBy]->(g)-[:regulator]->(x) | {{dbId: x.dbId, name: x.displayName, kind: g.schemaClass}}] AS regulators,
+  [(n)-[:literatureReference]->(x) WHERE x.pubMedIdentifier IS NOT NULL | x.pubMedIdentifier] AS pmids,
+  [(n)-[:hasEvent]->(x) | {_NAMED}][..60] AS events,
+  [(p:Pathway)-[:hasEvent]->(n) | {{dbId: p.dbId, name: p.displayName}}] AS pathways,
+  [(n)-[:hasComponent]->(x) | {_NAMED}] AS components,
+  [(n)-[:hasMember|hasCandidate]->(x) | {_NAMED}] AS members,
+  [(n)-[:referenceEntity]->(x) | x.databaseName + ':' + x.identifier][0] AS reference,
+  [(n)-[:hasModifiedResidue]->(x) | x.displayName] AS modifications,
+  [(n)-[:summation]->(x) | x.text][0] AS summary
+"""
+
+
+def reactome_instance(self, ident: str) -> Optional[Dict]:
+    ident = str(ident).strip()
+    db_id = int(ident) if ident.isdigit() else -1
+    with self.driver.session(database=self.database) as s:
+        r = s.run(_INSTANCE, id=db_id, st=ident).single()
+    if r is None:
+        return None
+    out = _clean(dict(r))
+    for k in ('events', 'pathways', 'inputs', 'outputs', 'catalysts', 'regulators', 'components', 'members'):
+        if k in out:
+            out[k] = [x for x in out[k] if not _DEPRECATED.search(x.get('name') or '')]
+    if out.get('summary') and len(out['summary']) > 800:
+        out['summary'] = out['summary'][:800] + '...'
+    return out
+
+
+def entities_of(self, identifier: str, limit: int = 25) -> List[Dict]:
+    q = f"""
+    MATCH (n:PhysicalEntity)-[:referenceEntity]->(x:ReferenceEntity) WHERE {_REF_WHERE}
+    RETURN n.dbId AS dbId, n.stId AS stId, n.displayName AS displayName, n.schemaClass AS schemaClass,
+           n.speciesName AS species, {_REF_DB} AS database, x.schemaClass AS reference_type,
+           [(n)-[:compartment]->(c) | c.displayName][0] AS compartment,
+           exists((n)-[:hasModifiedResidue]->()) AS modified,
+           size([(x)-[:hasComponent|hasMember|hasCandidate]->(n) | x]) AS in_complexes_or_sets
+    ORDER BY modified, in_complexes_or_sets DESC LIMIT $limit"""
+    acc, db = _ref_parts(identifier)
+    with self.driver.session(database=self.database) as s:
+        return [_clean(dict(r)) | {'modified': r['modified']} for r in s.run(q, acc=acc, db=db, limit=int(min(limit, 50)))]
+
+
+def events_of(self, identifier: str, limit: int = 25) -> List[Dict]:
+    q = f"""
+    MATCH (pe:PhysicalEntity)-[:referenceEntity]->(x:ReferenceEntity) WHERE {_REF_WHERE}
+    WITH DISTINCT pe
+    MATCH (x:PhysicalEntity)-[:hasComponent|hasMember|hasCandidate*0..4]->(pe)
+    WITH DISTINCT x
+    CALL {{
+      WITH x
+      MATCH (e:ReactionLikeEvent)-[:input]->(x) RETURN e, 'input' AS role
+      UNION WITH x MATCH (e:ReactionLikeEvent)-[:output]->(x) RETURN e, 'output' AS role
+      UNION WITH x MATCH (e:ReactionLikeEvent)-[:catalystActivity]->(:CatalystActivity)-[:physicalEntity]->(x)
+            RETURN e, 'catalyst' AS role
+      UNION WITH x MATCH (e:ReactionLikeEvent)-[:regulatedBy]->()-[:regulator]->(x) RETURN e, 'regulator' AS role
+    }}
+    WITH e, collect(DISTINCT role) AS roles
+    RETURN e.dbId AS dbId, e.stId AS stId, e.displayName AS displayName, roles,
+           [(p:Pathway)-[:hasEvent]->(e) WHERE NOT p.displayName =~ '(?i).*(clone of|replaced by).*' | p.displayName][..3]
+             AS pathways
+    ORDER BY size(roles) DESC, e.displayName LIMIT $limit"""
+    acc, db = _ref_parts(identifier)
+    with self.driver.session(database=self.database) as s:
+        rows = [_clean(dict(r)) for r in s.run(q, acc=acc, db=db, limit=int(min(limit, 50)))]
+    return [r for r in rows if not _DEPRECATED.search(r.get('displayName', ''))]
+
+
+def reference_names(self, identifier: str) -> List[str]:
+    """The names Reactome holds for a UniProt accession or ChEBI id (ReferenceEntity name and geneName lists)."""
+    q = (f'MATCH (x:ReferenceEntity) WHERE {_REF_WHERE} '
+         'RETURN coalesce(x.name, []) + coalesce(x.geneName, []) AS names LIMIT 1')
+    acc, db = _ref_parts(identifier)
+    with self.driver.session(database=self.database) as s:
+        r = s.run(q, acc=acc, db=db).single()
+    return list(dict.fromkeys(r['names'])) if r else []
+
+
+Neo4jInstanceLookup.reference_names = reference_names
+Neo4jInstanceLookup.search_reactome = search_reactome
+Neo4jInstanceLookup.reactome_instance = reactome_instance
+Neo4jInstanceLookup.entities_of = entities_of
+Neo4jInstanceLookup.events_of = events_of

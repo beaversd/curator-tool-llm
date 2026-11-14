@@ -56,7 +56,7 @@ def build_app():
                       upload_dir=os.getenv('UPLOAD_DIR', os.path.join(ROOT, 'data', 'uploads')),
                       cors_origins=origins, chat_model=AnthropicChatModel(),
                       qa_model=AnthropicChatModel(role='qa'), max_papers=int(os.getenv('MAX_PAPERS', '10')),
-                      auto_qa=os.getenv('AUTO_QA', '1') != '0', article_search=PubMedClient())
+                      auto_qa=os.getenv('AUTO_QA', '1') != '0', article_search=PubMedClient(), graph=lookup)
 
 
 app = build_app() if os.getenv('CURATOR_LLM_AUTOSTART', '1') == '1' else None

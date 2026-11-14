@@ -43,6 +43,28 @@ class FakeInstanceLookup:
         return next((i for i in self.instances if i['dbId'] == db_id), None)
 
 
+class FakeReactomeGraph:
+    """ReactomeGraph from tables: names (search), instances by dbId/stId, entities/events by identifier."""
+
+    def __init__(self, names=(), instances=None, entities=None, events=None):
+        self.names, self.instances = list(names), instances or {}
+        self.entities, self.events, self.calls = entities or {}, events or {}, []
+
+    def search_reactome(self, text, kind='any', species='Homo sapiens', limit=15):
+        self.calls.append(('search', text, kind, species))
+        return [r for r in self.names if text.lower() in r['displayName'].lower()][:limit]
+
+    def reactome_instance(self, ident):
+        self.calls.append(('instance', ident))
+        return self.instances.get(str(ident))
+
+    def entities_of(self, identifier, limit=25):
+        return self.entities.get(identifier, [])
+
+    def events_of(self, identifier, limit=25):
+        return self.events.get(identifier, [])
+
+
 class FakeUniProt:
     def __init__(self, entries: Dict[str, Dict], genes: Optional[Dict[str, str]] = None):
         self.entries, self.genes = entries, genes or {}

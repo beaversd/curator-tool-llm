@@ -30,7 +30,17 @@ class _Participant(BaseModel):
     name: str
     compartment: Optional[ExistingRef] = None
     compartment_name: Optional[str] = None   # kept so an unresolved compartment is not silently lost
+    # how the compartment was found (services/compartments.py): stated | shown (by the paper, with compartment_quote) |
+    # parts (all its components placed, in one compartment) | curator (a suggestion the curator accepted) | None
+    compartment_source: Optional[str] = None
+    compartment_quote: Optional[str] = None
+    # no evidence in the paper: a likely compartment from general knowledge, offered as a suggested fix (never applied);
+    # accepting it sets the compartment with source 'curator'
+    compartment_suggested: Optional[ExistingRef] = None
     needs_resolution: List[str] = Field(default_factory=list)   # e.g. ["uniprot", "compartment"]
+    # other names of the molecule (the paper's name before a rename, UniProt short names and gene synonyms): used to
+    # find it in the paper's text (services/compartments.py)
+    aliases: List[str] = Field(default_factory=list)
     existing: Optional[ExistingRef] = None   # set when this exact entity already exists: emit a shell
 
     @field_validator('needs_resolution')
@@ -100,6 +110,7 @@ class ReactionSpec(BaseModel):
     catalyst: Optional[CatalystSpec] = None
     regulations: List[RegulationSpec] = Field(default_factory=list)
     compartment: Optional[ExistingRef] = None
+    compartments: List[ExistingRef] = Field(default_factory=list)   # every compartment it happens in (its participants')
     summation: str = ''
     pmids: List[str] = Field(default_factory=list)
     evidence_ids: List[str] = Field(default_factory=list)

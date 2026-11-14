@@ -7,6 +7,7 @@ import os
 import time
 from typing import Callable, Dict, List, Optional
 
+from curator_llm.models.reactome import ExistingRef
 from curator_llm.models.session import Issue
 from curator_llm.ports.external import OntologyClient, UniProtClient
 from curator_llm.ports.lookup import InstanceLookup
@@ -31,9 +32,13 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 class DefaultPipeline:
     def __init__(self, lookup: InstanceLookup, uniprot: Optional[UniProtClient] = None,
                  ontology: Optional[OntologyClient] = None, model=None, review: bool = False,
-                 timeout: int = 1800, extractor: Optional[Extractor] = None, events: Optional[EventLookup] = None):
+                 timeout: int = 1800, extractor: Optional[Extractor] = None, events: Optional[EventLookup] = None,
+                 compartment_model=None, compartments: Optional[bool] = None):
         self.lookup, self.uniprot, self.ontology = lookup, uniprot, ontology
         self.model, self.events = model, events
+        # where each participant is, from the paper (services/compartments.py); COMPARTMENTS=0 turns it off
+        self.compartment_model = compartment_model
+        self.compartments = (os.getenv('COMPARTMENTS', '1') != '0') if compartments is None else compartments
         self.extractor = extractor or SubprocessExtractor(timeout=timeout, review=review)
 
     def run(self, spec: PipelineInput, report: Callable[[str], None]) -> PipelineResult:
@@ -102,6 +107,35 @@ class DefaultPipeline:
             return papers[src]
         return paper_for, papers
 
+    def _place(self, draft, store, papers: Dict[str, Optional[PaperText]], spec: PipelineInput, usage: list,
+               report: Callable[[str], None]) -> List[Issue]:
+        """Compartments from the paper (services/compartments.py). Never fails the annotation: a failure is an issue."""
+        from curator_llm.services.compartments import assign_compartments, reference_names
+        vocab_rows = getattr(self.lookup, 'compartments', None)
+        refs = spec.refs()
+        texts = {src: p.text for src, p in papers.items() if src != 'main' and p is not None and p.text}
+        if not texts and papers.get('main') is not None and refs:          # a single PDF is loaded under 'main'
+            texts = {refs[0].source: papers['main'].text}
+        if vocab_rows is None or not texts:      # a lookup without Reactome's compartment list, or no text: skip
+            logger.info('compartments skipped: %s', 'no compartment list' if vocab_rows is None else 'no paper text')
+            return []
+        report('placing each participant in its compartment, from the paper')
+        try:
+            vocab = {r['displayName']: ExistingRef(db_id=r['dbId'], display_name=r['displayName'],
+                                                   schema_class='Compartment') for r in vocab_rows()}
+            model = self.compartment_model
+            if model is None:
+                import sys
+                sys.path.insert(0, os.path.join(ROOT, 'reactome_llm'))
+                from ModelConfig import create_chat_model
+                model = create_chat_model('compartments')
+            return assign_compartments(draft, {e.id: e for e in store.all()}, texts, vocab, model, usage,
+                                       extra_names=reference_names(self.lookup, self.uniprot))
+        except Exception as e:
+            logger.warning('compartments failed: %s', e)
+            return [Issue(source='compartments', severity='warning', code='compartments_failed',
+                          message=f'compartments could not be placed ({type(e).__name__}: {e}); set them by hand')]
+
     def assemble(self, spec: PipelineInput, reactions: List[dict], paper_for, papers: Dict[str, Optional[PaperText]],
                  report: Callable[[str], None], draft=None) -> PipelineResult:
         """Everything after extraction: verify quotes, build the typed draft, resolve identifiers, look for
@@ -134,8 +168,13 @@ class DefaultPipeline:
 
         lap('quote verification + draft build')
         report('resolving identifiers')
-        issues += iss.issues_from_notes('resolver', Resolver(self.lookup, self.uniprot, self.ontology).resolve(draft))
+        resolver = Resolver(self.lookup, self.uniprot, self.ontology)
+        issues += iss.issues_from_notes('resolver', resolver.resolve(draft))
         lap('identifier resolution')
+        if self.compartments and draft.reactions:
+            issues += self._place(draft, store, papers, spec, usage, report)
+            issues += iss.issues_from_notes('resolver', resolver.match_existing(draft))
+            lap('compartments')
         existing = []
         if self.events is not None:
             report('checking Reactome for existing reactions')

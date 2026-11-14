@@ -201,6 +201,29 @@ class Resolver:
         self.notes = list(dict.fromkeys(self.notes))     # the same finding for several entities reads once
         return self.notes
 
+    def match_existing(self, draft: ReactomeDraft) -> List[str]:
+        """Once compartments are known (services/compartments.py): reuse the Reactome instance of each placed molecule
+        that already exists there, by display name ("LANA1 [nucleoplasm]"), else by structure (same identifier, same
+        compartment, no modified residues; exactly one match). Returns notes."""
+        notes: List[str] = []
+        find = getattr(self.lookup, 'find_unmodified_entity', None)
+        for p in draft.participants.values():
+            if p.existing is not None or p.compartment is None or not isinstance(p, (EwasSpec, SimpleEntitySpec)):
+                continue
+            classes = ['EntityWithAccessionedSequence'] if isinstance(p, EwasSpec) else ['SimpleEntity']
+            hit = _ref(self._call('Reactome graph', self.lookup.find_by_display_name, entity_display_name(p), classes))
+            if hit is None and find is not None and not getattr(p, 'modifications', None):
+                ident = p.uniprot if isinstance(p, EwasSpec) else ((p.chebi or '').split(':')[-1] or None)
+                if not ident and p.reference_entity is not None:        # a gene/transcript/molecule found in Reactome
+                    m = re.match(r'^[A-Za-z]+:(\S+)', p.reference_entity.display_name or '')
+                    ident = m.group(1) if m else None
+                rows = self._call('Reactome graph', find, ident, p.compartment.db_id, default=[]) if ident else []
+                hit = _ref(rows[0]) if len(rows) == 1 else None
+            if hit is not None:
+                p.existing = hit
+                notes.append(f'{p.name}: uses the existing Reactome instance {hit.display_name} (dbId {hit.db_id})')
+        return notes
+
     def _graph_accession(self, name: str, species: str = 'Homo sapiens') -> Optional[str]:
         """The accession Reactome already uses for this protein name in this species (no external call), when the
         lookup can say."""
@@ -267,6 +290,8 @@ class Resolver:
                     # name, which is what Reactome names the entity by
                     self._note(f'{p.name}: renamed {info["genes"][0]}, the UniProt gene name of {p.uniprot} '
                                f'({p.species}); confirm')
+                    if p.name not in p.aliases:
+                        p.aliases.append(p.name)          # the paper's name: still how the text refers to it
                     p.name = info['genes'][0]
                 elif p.name.upper() not in {g.upper() for g in info['genes']} and not any(
                         p.name.lower() in n.lower() for n in info['names']):

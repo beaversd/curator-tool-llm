@@ -287,7 +287,8 @@ class Emitter:
             'input': [self._participant(k) for k in r.inputs],
             'output': [self._participant(k) for k in r.outputs],
             'catalystActivity': cats, 'regulatedBy': regs,
-            'compartment': [self._shell_of(r.compartment)] if r.compartment else [],
+            'compartment': ([self._shell_of(c) for c in r.compartments] if r.compartments
+                            else [self._shell_of(r.compartment)] if r.compartment else []),
             'summation': self._summation(r.summation, r.pmids),
             'literatureReference': [self._publication(p) for p in r.pmids],
             'precedingEvent': preceding,

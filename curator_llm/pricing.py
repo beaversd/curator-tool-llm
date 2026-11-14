@@ -29,7 +29,7 @@ _BASE = {                      # input, output per million tokens
 
 # usage step -> the model_settings role whose model that step calls (when a usage entry does not name its model)
 STEP_ROLE = {'extraction': 'extraction', 'merge': 'merge', 'draft': 'draft', 'qa': 'qa', 'chat': 'chat',
-             'combine': 'merge', 'sections': 'sections', 'review': 'review'}
+             'combine': 'merge', 'sections': 'sections', 'review': 'review', 'compartments': 'compartments'}
 
 
 def prices() -> Dict[str, Dict[str, float]]:

@@ -23,13 +23,14 @@ class RestUniProtClient:
             j = r.json()
             if j.get('entryType') != 'Inactive':
                 genes = [g['geneName']['value'] for g in j.get('genes', []) if 'geneName' in g]
-                names = []
+                names, aliases = [], [s['value'] for g in j.get('genes', []) for s in g.get('synonyms', [])]
                 pd = j.get('proteinDescription', {})
                 for key in ('recommendedName', 'submissionNames', 'alternativeNames'):
                     v = pd.get(key)
                     for n in ([v] if isinstance(v, dict) else v or []):
                         names.append(n.get('fullName', {}).get('value', ''))
-                out = {'accession': j.get('primaryAccession', acc), 'genes': genes, 'names': names,
+                        aliases += [s['value'] for s in n.get('shortNames', [])]
+                out = {'accession': j.get('primaryAccession', acc), 'genes': genes, 'names': names, 'aliases': aliases,
                        'reviewed': 'reviewed' in j.get('entryType', '').lower() and 'unreviewed' not in j.get('entryType', '').lower(),
                        'organism': j.get('organism', {}).get('scientificName', '')}
         elif r.status_code not in (400, 404, 410):
