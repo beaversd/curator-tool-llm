@@ -401,6 +401,35 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                 'participants': {k: s.draft.participants[k] for k in used if k in s.draft.participants},
                 'evidence': [by_id[i] for i in r.evidence_ids if i in by_id]}
 
+    @router.get('/sessions/{session_id}/entities')
+    def entities(session_id: str, user: AuthUser = Depends(current_user)):
+        """Every entity of the draft (the reactions' participants and their parts), in draft order: the participant as in
+        the draft, its dbId among the exported instances (negative: new; positive: an existing Reactome instance, shell
+        only), the reactions using it with its roles, and the complexes/sets containing it."""
+        s = load(session_id, user)
+        if s.draft is None:
+            raise HTTPException(409, f'session is {s.status}; no draft yet')
+        ids = s.participant_to_db_id
+        if not ids and s.draft.participants:          # saved before the mapping was kept: emitting again gives the same ids
+            from curator_llm.services.emitter import emit_user_instances
+            ids = emit_user_instances(s.draft, {e.id: e for e in s.evidence}).participant_to_db_id
+        roles: Dict[str, List[dict]] = {}
+        for r in s.draft.reactions:
+            mine: Dict[str, List[str]] = {}
+            for role, keys in (('input', r.inputs), ('output', r.outputs),
+                               ('catalyst', [r.catalyst.entity] if r.catalyst else []),
+                               ('regulator', [g.regulator for g in r.regulations])):
+                for k in keys:
+                    mine.setdefault(k, []).append(role)
+            for k, rs in mine.items():
+                roles.setdefault(k, []).append({'key': r.key, 'name': r.name, 'roles': list(dict.fromkeys(rs))})
+        parents: Dict[str, List[str]] = {}
+        for k, p in s.draft.participants.items():
+            for x in list(getattr(p, 'components', []) or []) + list(getattr(p, 'members', []) or []):
+                parents.setdefault(x, []).append(k)
+        return [{'key': k, 'participant': p, 'dbId': ids.get(k), 'reactions': roles.get(k, []),
+                 'partOf': list(dict.fromkeys(parents.get(k, [])))} for k, p in s.draft.participants.items()]
+
     @router.get('/sessions/{session_id}/network')
     def network(session_id: str, user: AuthUser = Depends(current_user)):
         """The reactions and the entities they involve as nodes and edges (for drawing): input/output, catalyst,

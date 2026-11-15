@@ -642,6 +642,44 @@
         }
       }
     },
+    "/api/llm/sessions/{session_id}/entities": {
+      "get": {
+        "summary": "Entities",
+        "description": "Every entity of the draft (the reactions' participants and their parts), in draft order: the participant as in\nthe draft, its dbId among the exported instances (negative: new; positive: an existing Reactome instance, shell\nonly), the reactions using it with its roles, and the complexes/sets containing it.",
+        "operationId": "entities_api_llm_sessions__session_id__entities_get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/llm/sessions/{session_id}/network": {
       "get": {
         "summary": "Network",
@@ -1456,7 +1494,8 @@
               "pipeline",
               "existing",
               "qa",
-              "checks"
+              "checks",
+              "compartments"
             ],
             "title": "Source"
           },

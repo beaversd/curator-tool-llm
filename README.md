@@ -562,8 +562,8 @@ scripts/annotate_spreadsheet.sh papers.xlsx --jobs 3 --hierarchy --group-by "Dru
 #### Opening command-line results in the front-end
 
 `<name>.annotation.json` is the whole annotation as the service keeps it (draft, quotes, issues, suggested fixes, QA
-results, the papers' text), so a command-line run can be opened in Paper2Path like one started there: the Issues tab,
-the reaction panel with its quotes, the network, chat and proposed edits. An annotation belongs to one curator, by their
+results, the papers' text), so a command-line run can be opened in Paper2Path like one started there: the reactions with
+their issues and suggested fixes, the entities, the general issues, the network, chat and proposed edits. An annotation belongs to one curator, by their
 login name. Two ways to give it to one:
 
 1. **While annotating**: add `--owner USER`. The annotation is also saved among that curator's annotations, in the

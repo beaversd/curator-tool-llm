@@ -253,6 +253,7 @@ class SessionService:
                 and (i.reaction_key is None or i.reaction_key in alive)]
         emit = emit_user_instances(s.draft, {e.id: e for e in s.evidence})
         s.user_instances, s.evidence_links, s.key_to_db_id = emit.user_instances, emit.evidence_links, emit.key_to_db_id
+        s.participant_to_db_id = emit.participant_to_db_id
         have = {(i.code, i.participant_key) for i in kept}
         merged = kept + [f for f in iss.issues_from_draft(s.draft) if (f.code, f.participant_key) not in have]
         merged += iss.issues_from_notes('emitter', emit.warnings)

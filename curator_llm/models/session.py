@@ -113,6 +113,7 @@ class Session(BaseModel):
     user_instances: Optional[dict] = None
     evidence_links: List[dict] = Field(default_factory=list)
     key_to_db_id: Dict[str, int] = Field(default_factory=dict)
+    participant_to_db_id: Dict[str, int] = Field(default_factory=dict)   # participant key -> dbId in user_instances
     change_log: List[ChangeLogEntry] = Field(default_factory=list)
     paper: Optional[dict] = None                # PaperText.to_dict() of the first paper (kept for older sessions)
     papers: List[PaperInfo] = Field(default_factory=list)        # every paper of the session, in order
