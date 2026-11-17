@@ -1,4 +1,4 @@
-from typing import Callable, List, Optional, Protocol
+from typing import Callable, List, Literal, Optional, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -15,6 +15,14 @@ class FiPartner(BaseModel):
     score: float
 
 
+class PaperCheck(BaseModel):
+    """What an LLM read in a partner paper's abstract (role 'paper_check'): a guide to which papers to annotate, not a
+    finding. direct: a molecular event between the gene and the partner (binding, modification, transport, ...);
+    indirect: linked with no mechanism given; none: only mentioned together."""
+    relation: Literal['direct', 'indirect', 'none']
+    event: str = ''                             # the event in a few words; empty for none
+
+
 class PathwayEvidence(BaseModel):
     """A PubMed paper mentioning the gene together with a predicted pathway's partners or name terms."""
     pmid: str
@@ -25,13 +33,16 @@ class PathwayEvidence(BaseModel):
     partners_mentioned: List[str] = Field(default_factory=list)   # the pathway's partners named in title/abstract
     terms_mentioned: List[str] = Field(default_factory=list)      # key words of the pathway name found there
     sentences: List[str] = Field(default_factory=list)  # abstract sentences naming the gene with a partner/term
+    check: Optional[PaperCheck] = None          # partner papers only, when the search ran with its LLM steps
+    check_error: Optional[str] = None           # the check failed for this paper
 
 
 class PartnerEvidence(BaseModel):
     """The papers naming the gene with one of a predicted pathway's partners (PubMed: gene AND partner, title/abstract)."""
     partner: str
     count: int = 0                              # PubMed hits; `papers` holds the best few
-    papers: List[PathwayEvidence] = Field(default_factory=list)   # a sentence tying the two first, then relevance
+    # a sentence tying the two first, then relevance; with the checks, direct ones first, then indirect, none, unchecked
+    papers: List[PathwayEvidence] = Field(default_factory=list)
     error: Optional[str] = None                 # the search failed for this partner
 
 
@@ -73,7 +84,7 @@ class PathwayFinder(Protocol):
              max_pathways: int = 8, max_evidence: int = 5, summarize: bool = True,
              report: Optional[Callable[[str], None]] = None) -> GenePathwaysResult:
         """Gene symbol -> the Reactome pathways it is annotated in, and those its FI partners predict that it is not in
-        yet, each with up to max_evidence supporting papers and, with `summarize`, an LLM summary of them. The
-        prediction itself is LLM-free.
+        yet, each with up to max_evidence supporting papers and, with `summarize`, an LLM summary of them and an LLM
+        check of each partner paper's abstract. The prediction itself is LLM-free.
         Raises when the lookup itself fails. `report` (optional) is called with a short progress message."""
         ...

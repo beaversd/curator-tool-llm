@@ -44,7 +44,7 @@
       },
       "post": {
         "summary": "Start",
-        "description": "Annotate one paper by PubMed ID (`pmid`), or several (`pmids`) as one session: their reactions are merged into\na single draft, and a reaction several papers describe cites all of them.",
+        "description": "Annotate one paper by PubMed ID (`pmid`), or several (`pmids`) as one session: their reactions are merged into\na single draft, and a reaction several papers describe cites all of them. From Gene2Path, `partner` (with\n`focus`) puts the reactions involving both genes first and says when there is none, and `pathway_id` places\nthe draft in that existing pathway.",
         "operationId": "start_api_llm_sessions_post",
         "requestBody": {
           "content": {
@@ -118,7 +118,7 @@
     "/api/llm/pathways/by-gene": {
       "post": {
         "summary": "Pathways By Gene",
-        "description": "Find the Reactome pathways a gene could be annotated in (the prediction is LLM-free): those enriched among its top\nfunctional-interaction partners (binomial test, BH FDR) that the gene is not in yet, each with its literature\nevidence (PubMed papers naming the gene with the pathway's partners or name terms, and the abstract sentences\nthat do; and `partner_evidence`, the papers naming the gene with each partner on its own) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n], plus the\nreleased human pathways it is already in (Neo4j). Takes seconds to a minute or two: poll\nGET /jobs/{jobId}; when done, its `result` holds them. A gene with no FI partner, or no significant pathway, is a `status`, not a failed job.",
+        "description": "Find the Reactome pathways a gene could be annotated in (the prediction is LLM-free): those enriched among its top\nfunctional-interaction partners (binomial test, BH FDR) that the gene is not in yet, each with its literature\nevidence (PubMed papers naming the gene with the pathway's partners or name terms, and the abstract sentences\nthat do; and `partner_evidence`, the papers naming the gene with each partner on its own) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n]\nand an LLM check of each partner paper's abstract (`check.relation`: direct / indirect / none, direct first),\nplus the released human pathways it is already in (Neo4j). To annotate a partner's papers, start a session with\nPOST /sessions {pmids, focus: gene, partner, pathway_id}. Takes seconds to a minute or two: poll\nGET /jobs/{jobId}; when done, its `result` holds them. A gene with no FI partner, or no significant pathway, is a `status`, not a failed job.",
         "operationId": "pathways_by_gene_api_llm_pathways_by_gene_post",
         "requestBody": {
           "content": {
@@ -1560,6 +1560,29 @@
               }
             ],
             "title": "Focus"
+          },
+          "partner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partner"
+          },
+          "pathway_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pathway Id"
           }
         },
         "type": "object",

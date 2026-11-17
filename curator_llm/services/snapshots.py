@@ -44,13 +44,17 @@ def _paper_key(ref: PaperRef) -> str:
 
 def snapshot_key(spec: PipelineInput) -> str:
     """pmid-24751536__PINK1, or pdf-<hash of the file>__PINK1; for several papers multi-<hash of their keys, in any order>.
-    The focus changes what the draft is about."""
+    The focus changes what the draft is about; a Gene2Path session adds its partner and pathway (__PRKN__pw5205685)."""
     keys = [_paper_key(r) for r in spec.refs()]
     if not keys:
         raise ValueError('need a pmid or a pdf')
     base = keys[0] if len(keys) == 1 else 'multi-' + hashlib.sha256('|'.join(sorted(keys)).encode()).hexdigest()[:16]
     focus = ''.join(c for c in (spec.focus or '').strip().upper() if c.isalnum() or c in '-_')
-    return f'{base}__{focus}' if focus else base
+    key = f'{base}__{focus}' if focus else base
+    partner = ''.join(c for c in (spec.partner or '').strip().upper() if c.isalnum() or c in '-_')
+    if partner:                                    # Gene2Path: the partner and pathway change the draft too
+        key += f'__{partner}'
+    return key + (f'__pw{spec.pathway_id}' if spec.pathway_id else '')
 
 
 class SnapshotStore:

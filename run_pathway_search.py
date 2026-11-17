@@ -4,7 +4,10 @@ test, BH FDR), each with its literature evidence: PubMed papers that mention the
 or the key words of its name, and the abstract sentences that do; and, per partner in the pathway, the papers naming
 the gene with that partner (one PubMed search each), so every partner shows its own evidence or the lack of it. The prediction itself is LLM-free; the only LLM step is
 an optional summary per predicted pathway (role 'pathway_summary'), written from that pathway's papers alone and citing
-them as [PMID:n], so the curator can read what the literature says before opening the papers. The prediction is the gene-first pipeline's own
+them as [PMID:n], so the curator can read what the literature says before opening the papers, and, with it, a check of
+each partner paper's abstract (role 'paper_check'): does it describe a biochemical event between the gene and that
+partner (`check.relation` direct / indirect / none, and the event in a few words). Direct papers are listed first; they
+are the ones worth annotating in Paper2Path (POST /sessions {pmids, focus: gene, partner, pathway_id}). The prediction is the gene-first pipeline's own
 placement (ReactomeUtils.suggest_pathway_placement), so `confident` means what it means there. Used by Gene2Path in
 curator-tool-frontend. The REST service runs this as a subprocess (curator_llm/adapters/pathway_finder_subprocess.py)
 because ReactomeUtils imports the gene-first pipeline's heavy dependencies, which the service itself does not.
@@ -13,7 +16,7 @@ Usage:
     python run_pathway_search.py PINK1
     python run_pathway_search.py PINK1 --fi-cutoff 0.8 --top-partners 10 --fdr-cutoff 0.05 --max-pathways 8 \
         --max-evidence 5 --out r.json
-    python run_pathway_search.py PINK1 --no-summaries      # LLM-free
+    python run_pathway_search.py PINK1 --no-summaries      # LLM-free (no summaries, no partner paper checks)
 
 Progress lines start with "[progress] "; the result is written to --out as JSON. Exit status 1 when a lookup fails.
 A gene with no partners or no significant pathway is not a failure: see `status` in the result.
@@ -35,6 +38,8 @@ SEARCH_POOL = 20          # papers fetched per pathway, before ranking them here
 PARTNER_POOL = 10         # papers fetched per partner of a pathway, before ranking them here
 PARTNER_PAPERS = 3        # papers listed per partner
 SUMMARY_WORKERS = 4       # pathway summaries written at the same time
+CHECK_WORKERS = 8         # partner paper abstracts checked at the same time
+RELATIONS = ('direct', 'indirect', 'none')   # a partner paper's check, best first
 # Words of a pathway name that say nothing about what it is about, left out of its literature search.
 GENERIC_WORDS = {'signaling', 'signalling', 'pathway', 'pathways', 'regulation', 'regulates', 'regulated', 'mediated',
                  'activation', 'activated', 'activity', 'cycle', 'process', 'processes', 'response', 'events', 'event',
@@ -233,9 +238,9 @@ def pmc_ids(pmids):
 
 def add_evidence(gene, pathways, max_papers):
     """Fill in each pathway's `evidence`, `evidence_count`, `partner_evidence` and, when a lookup failed,
-    `evidence_error` / `partner_evidence_error` (in place). Returns {pmid: abstract} over the pathway-level papers
-    listed, for add_summaries."""
-    abstracts = {}
+    `evidence_error` / `partner_evidence_error` (in place). Returns ({pmid: abstract} over the pathway-level papers
+    listed, for add_summaries; {pmid: abstract} of every paper fetched, for add_paper_checks)."""
+    abstracts, fetched = {}, {}
     for p in pathways:
         progress(f"finding the literature for {p['pathway_name']}")
         articles = {}
@@ -248,11 +253,12 @@ def add_evidence(gene, pathways, max_papers):
             p['partner_evidence'] = partner_evidence(gene, p['mapped_genes'], articles)
         except Exception as e:
             p['partner_evidence'], p['partner_evidence_error'] = [], f'{type(e).__name__}: {e}'
+        fetched.update({pmid: a['abstract'] for pmid, a in articles.items()})
     papers = [e for p in pathways for e in p['evidence'] + [e for pe in p['partner_evidence'] for e in pe['papers']]]
     pmc = pmc_ids(sorted({e['pmid'] for e in papers}))
     for e in papers:
         e['pmcid'] = pmc.get(e['pmid'])
-    return abstracts
+    return abstracts, fetched
 
 
 def summary_model():
@@ -322,6 +328,83 @@ def add_summaries(gene, pathways, abstracts):
         list(pool.map(one, todo))
 
 
+def check_model():
+    """The LangChain chat model for the partner paper checks (role 'paper_check' in curator_llm/model_settings.py)."""
+    from ModelConfig import create_chat_model
+    return create_chat_model('paper_check', max_tokens=300)
+
+
+def check_prompt(gene, partner, title, abstract):
+    return f"""A Reactome curator wants to annotate a biochemical reaction involving {gene} and {partner}. Read this \
+PubMed abstract and say whether it reports such an event between the two (their proteins, genes or transcripts).
+
+direct: it reports a molecular event between {gene} and {partner}: one binds, modifies (phosphorylates, ubiquitinates, \
+cleaves, ...), transports, activates or inhibits the other, they form a complex, or one regulates the other's \
+transcription by binding its gene. The experiment may be in any species or cell system.
+indirect: both act in the same process, or one affects the other, but the abstract gives no molecular mechanism \
+linking them (genetic interaction, epistasis, co-expression, one upstream of the other).
+none: they are only mentioned together, or the abstract is about something else.
+
+Reply with ONE JSON object and nothing else: {{"relation": "direct" | "indirect" | "none", "event": "..."}}. `event` is \
+the event in at most 15 words for direct or indirect (e.g. "{gene} phosphorylates {partner} at Ser65"), and an empty \
+string for none.
+
+Title: {title}
+Abstract: {abstract or '(no abstract)'}"""
+
+
+_JSON_OBJECT = re.compile(r'\{.*\}', re.S)
+
+
+def check_paper(model, gene, partner, title, abstract):
+    """{'relation', 'event'} for one partner paper. Raises on an unreadable reply."""
+    text = _reply_text(model.invoke(check_prompt(gene, partner, title, abstract)).content)
+    m = _JSON_OBJECT.search(text)
+    reply = json.loads(m.group(0), strict=False) if m else {}     # strict=False: a raw line break in a string
+    relation = str(reply.get('relation', '')).strip().lower()
+    if relation not in RELATIONS:
+        raise ValueError(f'unreadable reply: {text[:120]!r}')
+    event = re.sub(r'\s+', ' ', str(reply.get('event') or '')).strip() if relation != 'none' else ''
+    return {'relation': relation, 'event': event}
+
+
+def add_paper_checks(gene, pathways, abstracts):
+    """Fill in `check` (or `check_error`) on every partner paper, and list each partner's papers direct first, then
+    indirect, none, unchecked (in place). A paper listed for the same partner under several pathways is checked once.
+    `abstracts` is {pmid: abstract}. A paper without an abstract is not checked: there is nothing to read."""
+    entries = [(pe['partner'], e) for p in pathways for pe in p.get('partner_evidence') or [] for e in pe['papers']]
+    todo = {}
+    for partner, e in entries:
+        if abstracts.get(e['pmid']):
+            todo.setdefault((partner, e['pmid']), e['title'])
+    if todo:
+        progress(f'checking {len(todo)} partner paper{"s" if len(todo) != 1 else ""} for a biochemical relationship')
+        try:
+            model = check_model()
+            done = {}
+
+            def one(item):
+                (partner, pmid), title = item
+                try:
+                    done[(partner, pmid)] = check_paper(model, gene, partner, title, abstracts[pmid])
+                except Exception as e:
+                    done[(partner, pmid)] = f'{type(e).__name__}: {e}'
+            with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
+                list(pool.map(one, todo.items()))
+        except Exception as e:
+            done = {k: f'{type(e).__name__}: {e}' for k in todo}
+        for partner, e in entries:
+            r = done.get((partner, e['pmid']))
+            if isinstance(r, dict):
+                e['check'] = dict(r)
+            elif r:
+                e['check_error'] = r
+    rank = {r: i for i, r in enumerate(RELATIONS)}
+    for p in pathways:
+        for pe in p.get('partner_evidence') or []:
+            pe['papers'].sort(key=lambda e: rank.get((e.get('check') or {}).get('relation'), len(RELATIONS)))
+
+
 def search(gene, fi_cutoff=0.8, top_partners=10, fdr_cutoff=0.05, max_pathways=8, max_evidence=5, summarize=True):
     progress('looking up the pathways it is annotated in')
     annotated = annotated_pathways(gene)
@@ -335,9 +418,10 @@ def search(gene, fi_cutoff=0.8, top_partners=10, fdr_cutoff=0.05, max_pathways=8
         predicted = [dict(p, annotated=False) for p in enriched_pathways([p['gene'] for p in partners], fdr_cutoff)
                      if p['pathway_id'] not in in_already][:max_pathways]
         if max_evidence > 0:
-            abstracts = add_evidence(gene, predicted, max_evidence)
+            abstracts, fetched = add_evidence(gene, predicted, max_evidence)
             if summarize:
                 add_summaries(gene, predicted, abstracts)
+                add_paper_checks(gene, predicted, fetched)
     return {'gene': gene, 'annotated_pathways': annotated, 'status': place.get('status') or 'ok',
             'confident': bool(confident), 'predicted_pathways': predicted,
             'partners': [{'gene': p['gene'], 'score': float(p['score'])} for p in partners],
@@ -355,7 +439,8 @@ def main(argv=None):
                     help='predicted pathways listed, those the gene is not in yet (default 8)')
     ap.add_argument('--max-evidence', type=int, default=5, help='papers listed per pathway, 0 for none (default 5)')
     ap.add_argument('--no-summaries', dest='summarize', action='store_false',
-                    help="skip the LLM summary of each predicted pathway's literature")
+                    help="skip the LLM steps: the summary of each predicted pathway's literature and the check of "
+                         "each partner paper's abstract")
     ap.add_argument('--out', help='write the result here as JSON')
     args = ap.parse_args(argv)
     result = search(args.gene.strip().upper(), args.fi_cutoff, args.top_partners, args.fdr_cutoff, args.max_pathways,
@@ -374,8 +459,8 @@ def main(argv=None):
             print(f"      {e['pmid']:<10} {', '.join(e['partners_mentioned'] + e['terms_mentioned'])}  "
                   f"{e['title'][:70]}", flush=True)
         for pe in p.get('partner_evidence') or []:
-            print(f"      {pe['partner']:<10} {pe.get('error') or str(pe['count']) + ' papers'}  "
-                  f"{' '.join(e['pmid'] for e in pe['papers'])}", flush=True)
+            papers = ' '.join(e['pmid'] + (f"({e['check']['relation']})" if e.get('check') else '') for e in pe['papers'])
+            print(f"      {pe['partner']:<10} {pe.get('error') or str(pe['count']) + ' papers'}  {papers}", flush=True)
 
 
 if __name__ == '__main__':

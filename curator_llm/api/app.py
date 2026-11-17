@@ -38,6 +38,10 @@ class StartRequest(BaseModel):
     pmid: Optional[str] = None                       # one paper ...
     pmids: List[str] = Field(default_factory=list)   # ... or several: merged into ONE draft, across papers
     focus: Optional[str] = None
+    # From Gene2Path: the FI partner whose papers these are (needs `focus`; the reactions involving both come first),
+    # and the predicted pathway (dbId) the draft is placed in.
+    partner: Optional[str] = None
+    pathway_id: Optional[int] = Field(None, gt=0)
 
 
 class GeneSearchRequest(BaseModel):
@@ -52,7 +56,7 @@ class GenePathwaysRequest(BaseModel):
     fdr_cutoff: float = Field(0.05, gt=0, le=1)        # highest FDR for a predicted pathway
     max_pathways: int = Field(8, ge=1, le=50)          # predicted pathways listed (the gene is not in them yet)
     max_evidence: int = Field(5, ge=0, le=20)          # papers per pathway; 0 skips the literature lookup
-    summarize: bool = True                             # LLM summary of each predicted pathway's papers
+    summarize: bool = True                             # LLM summary of each pathway's papers, LLM check of each partner paper
 
 
 _GENE = re.compile(r'[A-Z0-9][A-Z0-9.-]{0,24}')
@@ -132,14 +136,21 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
     @router.post('/sessions', status_code=202)
     def start(req: StartRequest, user: AuthUser = Depends(current_user)):
         """Annotate one paper by PubMed ID (`pmid`), or several (`pmids`) as one session: their reactions are merged into
-        a single draft, and a reaction several papers describe cites all of them."""
+        a single draft, and a reaction several papers describe cites all of them. From Gene2Path, `partner` (with
+        `focus`) puts the reactions involving both genes first and says when there is none, and `pathway_id` places
+        the draft in that existing pathway."""
         pmids = parse_pmids(req.pmid, req.pmids)
         if not pmids:
             raise HTTPException(422, 'give a pmid, or a list of pmids')
         if len(pmids) > max_papers:
             raise HTTPException(422, f'at most {max_papers} papers per session')
-        spec = (PipelineInput(pmid=pmids[0], focus=req.focus) if len(pmids) == 1 else
-                PipelineInput(papers=[PaperRef(pmid=p) for p in pmids], focus=req.focus))
+        focus = (req.focus or '').strip() or None
+        partner = (req.partner or '').strip().upper() or None
+        if partner and not (focus and _GENE.fullmatch(partner)):
+            raise HTTPException(422, 'a partner needs a focus gene' if not focus else f'not a gene symbol: {req.partner!r}')
+        extra = {'focus': focus, 'partner': partner, 'pathway_id': req.pathway_id}
+        spec = (PipelineInput(pmid=pmids[0], **extra) if len(pmids) == 1 else
+                PipelineInput(papers=[PaperRef(pmid=p) for p in pmids], **extra))
         sid, jid = svc().start(user.username, spec)
         return {'sessionId': sid, 'jobId': jid}
 
@@ -163,8 +174,10 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         """Find the Reactome pathways a gene could be annotated in (the prediction is LLM-free): those enriched among its top
         functional-interaction partners (binomial test, BH FDR) that the gene is not in yet, each with its literature
         evidence (PubMed papers naming the gene with the pathway's partners or name terms, and the abstract sentences
-        that do; and `partner_evidence`, the papers naming the gene with each partner on its own) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n], plus the
-        released human pathways it is already in (Neo4j). Takes seconds to a minute or two: poll
+        that do; and `partner_evidence`, the papers naming the gene with each partner on its own) and, unless `summarize` is false, an LLM summary of those papers citing them as [PMID:n]
+        and an LLM check of each partner paper's abstract (`check.relation`: direct / indirect / none, direct first),
+        plus the released human pathways it is already in (Neo4j). To annotate a partner's papers, start a session with
+        POST /sessions {pmids, focus: gene, partner, pathway_id}. Takes seconds to a minute or two: poll
         GET /jobs/{jobId}; when done, its `result` holds them. A gene with no FI partner, or no significant pathway, is a `status`, not a failed job."""
         if pathway_finder is None:
             raise HTTPException(503, 'gene search is not configured (GENE_SEARCH=1)')
@@ -231,7 +244,7 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
     def get_session(session_id: str, user: AuthUser = Depends(current_user)):
         s = load(session_id, user)
         out = SessionSummary.of(s).model_dump()
-        out.update({'focus': s.focus, 'error': s.error,
+        out.update({'focus': s.focus, 'partner': s.partner, 'pathway_id': s.pathway_id, 'error': s.error,
                     'papers': [p.model_dump() for p in s.papers] or [
                         PaperInfo(source=s.source, kind='pmid' if s.pmid else 'pdf', pmid=s.pmid, name=s.source).model_dump()],
                     'reactions': [{'key': r.key, 'name': r.name, 'dbId': s.key_to_db_id.get(r.key),

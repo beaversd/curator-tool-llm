@@ -82,6 +82,8 @@ class Session(BaseModel):
     pmid: Optional[str] = None
     source: str = ''                           # pmid or uploaded file name
     focus: Optional[str] = None
+    partner: Optional[str] = None               # Gene2Path: the focus gene's partner these papers were chosen for
+    pathway_id: Optional[int] = None            # Gene2Path: the predicted pathway the draft is placed in
     status: Literal['queued', 'running', 'ready', 'failed'] = 'queued'
     progress: str = ''
     error: Optional[str] = None

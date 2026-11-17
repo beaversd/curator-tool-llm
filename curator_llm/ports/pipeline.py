@@ -27,6 +27,8 @@ class PipelineInput:
     pdf_path: Optional[str] = None
     focus: Optional[str] = None        # gene/protein the curator cares about; None = whole paper
     papers: List[PaperRef] = field(default_factory=list)   # several papers, merged into ONE draft (pmid/pdf_path unused)
+    partner: Optional[str] = None      # Gene2Path: the focus gene's FI partner; reactions involving both come first
+    pathway_id: Optional[int] = None   # Gene2Path: the existing pathway (dbId) the draft is placed in
 
     def refs(self) -> List[PaperRef]:
         """The papers to annotate: `papers` if given, else the single pmid or pdf_path."""

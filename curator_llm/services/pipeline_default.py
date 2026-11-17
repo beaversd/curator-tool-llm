@@ -22,6 +22,7 @@ from curator_llm.services.existing_events import find_existing
 from curator_llm.services.extraction import SubprocessExtractor
 from curator_llm.services.paper_loader import load_paper_text
 from curator_llm.services.paper_text import PaperText
+from curator_llm.services.partner_link import link_partner, place_in_pathway
 from curator_llm.services.resolvers import Resolver
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,17 @@ class DefaultPipeline:
             takes_report = False
         args = (refs[0].pmid, refs[0].pdf_path, gene) if len(refs) == 1 else (refs, gene)
         return method(*args, report=report) if takes_report else method(*args)
+
+    def _accessions(self, symbols: List[str]) -> Dict[str, Optional[str]]:
+        """{symbol: human UniProt accession or None}; best effort (a failed lookup leaves names to match on)."""
+        out: Dict[str, Optional[str]] = {}
+        for sym in symbols:
+            try:
+                out[sym] = self.uniprot.search_gene(sym) if self.uniprot else None
+            except Exception as e:
+                logger.warning('UniProt lookup for %s failed: %s', sym, e)
+                out[sym] = None
+        return out
 
     @staticmethod
     def _paper_loader(spec: PipelineInput):
@@ -127,6 +139,10 @@ class DefaultPipeline:
         report('resolving identifiers')
         issues += iss.issues_from_notes('resolver', Resolver(self.lookup, self.uniprot, self.ontology).resolve(draft))
         lap('identifier resolution')
+        if spec.pathway_id:
+            issues += place_in_pathway(draft, spec.pathway_id, self.lookup)
+        if spec.partner and spec.focus:
+            issues += link_partner(draft, spec.focus, spec.partner, self._accessions([spec.focus, spec.partner]))
         existing = []
         if self.events is not None:
             report('checking Reactome for existing reactions')

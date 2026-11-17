@@ -48,6 +48,7 @@ DEFAULTS: Dict[str, ModelSpec] = {
     'chat':        ModelSpec('claude-sonnet-5-5'),                 # chat agent
     'qa':          ModelSpec('claude-sonnet-5-5', thinking=False),  # per-reaction QA review (one short JSON reply)
     'pathway_summary': ModelSpec('claude-sonnet-5-5', thinking=False),  # run_pathway_search.py: Gene2Path literature summary per pathway
+    'paper_check': ModelSpec('claude-haiku-5-5', thinking=False),   # run_pathway_search.py: does a partner paper's abstract describe a biochemical event
     # --- gene-first pipeline (run_curator.py, LangChain) ---
     'gene':        ModelSpec('claude-sonnet-4-6', temperature=1.0),  # curator, reviewer, QA
     'convert':     ModelSpec('claude-sonnet-4-6', temperature=0.1),  # reaction_to_instances.py

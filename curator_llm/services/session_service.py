@@ -88,7 +88,8 @@ class SessionService:
         papers = [PaperInfo(source=r.source, kind='pmid' if r.pmid else 'pdf', pmid=r.pmid,
                             name=r.label or (r.pmid if r.pmid else r.source)) for r in refs]
         first_pmid = next((r.pmid for r in refs if r.pmid), None)
-        s = Session(owner=owner, pmid=first_pmid, focus=spec.focus, papers=papers,
+        s = Session(owner=owner, pmid=first_pmid, focus=spec.focus, partner=spec.partner, pathway_id=spec.pathway_id,
+                    papers=papers,
                     source=source_label or self._source_label(papers))
         self.store.save(s)
         job_id = self.jobs.submit(owner, lambda report: self._run(s.id, owner, spec, report))

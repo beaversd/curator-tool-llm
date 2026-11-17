@@ -1,5 +1,6 @@
 """Gene -> Reactome pathways (Gene2Path): the REST route, the subprocess adapter, and run_pathway_search.py's assembly."""
 import json
+import re
 import subprocess
 import sys
 
@@ -174,11 +175,15 @@ def script(monkeypatch):
     """run_pathway_search with its Neo4j, FI, enrichment and PubMed lookups faked. state['papers'] is
     {pmid: {title, journal, year, abstract}}; every evidence search returns all of them, in that order; a partner
     search returns state['partner_hits'][partner] (none by default) and fails for partners in state['partner_fails'].
-    The summary model is a FakeSummaryModel: state['prompts'] holds what it was asked, state['reply'] what it says."""
+    The summary model is a FakeSummaryModel: state['prompts'] holds what it was asked, state['reply'] what it says.
+    The paper check model is a FakeCheckModel: state['checks'] holds (partner, title) asked, state['check_replies']
+    {title: reply} what it says (a 'none' verdict by default)."""
     import run_pathway_search as rps
     state = {'annotated': [], 'placement': ({'status': 'ok', 'partners_used': []}, False), 'enriched': [],
-             'papers': {}, 'queries': [], 'partner_queries': [], 'prompts': [], 'reply': 'A summary.'}
+             'papers': {}, 'queries': [], 'partner_queries': [], 'prompts': [], 'reply': 'A summary.',
+             'checks': [], 'check_replies': {}}
     monkeypatch.setattr(rps, 'summary_model', lambda: FakeSummaryModel(state))
+    monkeypatch.setattr(rps, 'check_model', lambda: FakeCheckModel(state))
 
     def pubmed_search(query):
         state['queries'].append(query)
@@ -213,6 +218,20 @@ class FakeSummaryModel:
     def invoke(self, prompt):
         self.state['prompts'].append(prompt)
         reply = self.state['reply']
+        if isinstance(reply, Exception):
+            raise reply
+        return type('Reply', (), {'content': reply})()
+
+
+class FakeCheckModel:
+    def __init__(self, state):
+        self.state = state
+
+    def invoke(self, prompt):
+        partner = re.search(r'involving \S+ and (\S+)\.', prompt).group(1)
+        title = re.search(r'^Title: (.*)$', prompt, re.M).group(1)
+        self.state['checks'].append((partner, title))
+        reply = self.state['check_replies'].get(title, '{"relation": "none", "event": ""}')
         if isinstance(reply, Exception):
             raise reply
         return type('Reply', (), {'content': reply})()
@@ -450,3 +469,70 @@ def test_summaries_can_be_turned_off(script, tmp_path):
     res = json.loads(out.read_text())
     assert state['prompts'] == [] and 'summary' not in res['predicted_pathways'][0]
     assert res['params']['summarize'] is False and res['predicted_pathways'][0]['evidence']
+
+
+# ── partner paper checks ──────────────────────────────────────────────────
+
+def partner_papers(state, pathways=1):
+    state['placement'] = predicted()
+    state['enriched'] = [{'pathway_id': i, 'pathway_name': f'P{i}', 'fdr': 1e-4, 'overlap_count': 2,
+                          'mapped_genes': ['PRKN', 'RHOT1']} for i in range(pathways)]
+    state['papers'] = {
+        '1': {'title': 'Co-mention', 'journal': 'J', 'year': '2010', 'abstract': 'PINK1 and PRKN in disease.'},
+        '2': {'title': 'Kinase', 'journal': 'Cell', 'year': '2014', 'abstract': 'PINK1 phosphorylates PRKN.'},
+        '3': {'title': 'Genetics', 'journal': 'J', 'year': '2008', 'abstract': 'PINK1 acts upstream of PRKN.'},
+        '4': {'title': 'No abstract', 'journal': 'J', 'year': '2001', 'abstract': ''}}
+    state['partner_hits'] = {'PRKN': ['1', '2', '3', '4'], 'RHOT1': []}
+
+
+def test_partner_papers_are_checked_and_listed_direct_first(script, monkeypatch):
+    rps, state = script
+    monkeypatch.setattr(rps, 'PARTNER_PAPERS', 4)
+    partner_papers(state)
+    state['check_replies'] = {
+        'Kinase': 'Sure: {"relation": "Direct", "event": "PINK1  phosphorylates\nPRKN at Ser65"}',
+        'Genetics': '{"relation": "indirect", "event": "PINK1 acts upstream of PRKN"}'}
+    res = rps.search('PINK1')
+    prkn = res['predicted_pathways'][0]['partner_evidence'][0]
+    assert [e['pmid'] for e in prkn['papers']] == ['2', '3', '1', '4']        # direct, indirect, none, unchecked
+    assert prkn['papers'][0]['check'] == {'relation': 'direct', 'event': 'PINK1 phosphorylates PRKN at Ser65'}
+    assert prkn['papers'][2]['check'] == {'relation': 'none', 'event': ''}
+    assert 'check' not in prkn['papers'][3] and 'check_error' not in prkn['papers'][3]   # no abstract, not asked
+    assert sorted(state['checks']) == [('PRKN', 'Co-mention'), ('PRKN', 'Genetics'), ('PRKN', 'Kinase')]
+    from curator_llm.ports.pathway_finder import GenePathwaysResult
+    checked = GenePathwaysResult.model_validate(res).predicted_pathways[0].partner_evidence[0].papers[0]
+    assert checked.check.relation == 'direct'
+
+
+def test_a_paper_listed_under_several_pathways_is_checked_once(script):
+    rps, state = script
+    partner_papers(state, pathways=3)
+    rps.search('PINK1')
+    assert len(state['checks']) == len(set(state['checks'])) == 3
+
+
+def test_a_failed_or_unreadable_check_is_reported_on_the_paper(script):
+    rps, state = script
+    partner_papers(state)
+    state['check_replies'] = {'Kinase': RuntimeError('overloaded'), 'Genetics': 'I cannot tell.'}
+    papers = {e['title']: e for e in rps.search('PINK1')['predicted_pathways'][0]['partner_evidence'][0]['papers']}
+    assert 'overloaded' in papers['Kinase']['check_error'] and 'check' not in papers['Kinase']
+    assert 'unreadable reply' in papers['Genetics']['check_error']
+    assert papers['Co-mention']['check']['relation'] == 'none'
+
+
+def test_no_check_model_is_reported_on_every_paper(script, monkeypatch):
+    rps, state = script
+    partner_papers(state)
+    def no_key():
+        raise ValueError('ANTHROPIC_API_KEY is not set')
+    monkeypatch.setattr(rps, 'check_model', no_key)
+    papers = rps.search('PINK1')['predicted_pathways'][0]['partner_evidence'][0]['papers']
+    assert all('ANTHROPIC_API_KEY' in e['check_error'] for e in papers)
+
+
+def test_checks_are_off_with_the_summaries(script):
+    rps, state = script
+    partner_papers(state)
+    papers = rps.search('PINK1', summarize=False)['predicted_pathways'][0]['partner_evidence'][0]['papers']
+    assert state['checks'] == [] and not any('check' in e for e in papers)
