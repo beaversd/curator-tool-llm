@@ -8,7 +8,7 @@ import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from curator_llm.models.evidence import ClaimOrigin, Evidence, Verification
-from curator_llm.models.session import ChangeLogEntry, Issue, PaperInfo, Proposal, Session
+from curator_llm.models.session import ChangeLogEntry, Issue, PaperInfo, Proposal, ReactionQA, Session
 from curator_llm.models.usage import UsageEntry
 from curator_llm.ports.jobs import JobRunner
 from curator_llm.ports.pipeline import PaperRef, Pipeline, PipelineInput
@@ -20,7 +20,7 @@ from curator_llm.services.existing_events import find_existing
 from curator_llm.services.paper_text import PaperText
 from curator_llm.services.patching import PatchError, apply_patch, describe_changes, touched_reactions
 from curator_llm.services.qa import AUTO_RULE_CODES, auto_findings, qa_reaction, rank_results
-from curator_llm.services.suggestions import suggest_fixes as make_suggestions
+from curator_llm.services.suggestions import remove_reaction_ops, suggest_fixes as make_suggestions
 
 
 class ProposalError(ValueError):
@@ -70,10 +70,14 @@ def _carry_over(previous: List[Issue], fresh: List[Issue], key: Callable[[Issue]
 
 class SessionService:
     def __init__(self, store: SessionStore, jobs: JobRunner, pipeline: Pipeline,
-                 resolver_factory: Optional[Callable] = None, events=None):
+                 resolver_factory: Optional[Callable] = None, events=None, qa_model=None, auto_qa: bool = False,
+                 qa_workers: int = 8):
         self.store, self.jobs, self.pipeline = store, jobs, pipeline
         self.resolver_factory = resolver_factory     # () -> Resolver, to resolve entities an edit introduces
         self.events = events                         # EventLookup, to check for existing Reactome events
+        # with auto_qa, every reaction of a new draft gets the model's QA review before the session is ready (not for a
+        # replayed run, which promises no model calls); the curator can always run it again (POST .../qa)
+        self.qa_model, self.auto_qa, self.qa_workers = qa_model, auto_qa, qa_workers
 
     def _ready(self, owner: str, session_id: str) -> Session:
         s = self.store.get(session_id, owner)
@@ -85,9 +89,9 @@ class SessionService:
     def start(self, owner: str, spec: PipelineInput, source_label: Optional[str] = None) -> Tuple[str, str]:
         """Create the session, queue the pipeline, return (session_id, job_id)."""
         refs = spec.refs()
-        papers = [PaperInfo(source=r.source, kind='pmid' if r.pmid else 'pdf', pmid=r.pmid,
-                            name=r.label or (r.pmid if r.pmid else r.source)) for r in refs]
-        first_pmid = next((r.pmid for r in refs if r.pmid), None)
+        papers = [PaperInfo(source=r.source, kind='pmid' if r.pmid else 'pdf', pmid=r.pmid or r.pdf_pmid,
+                            name=r.label or (r.pmid if r.pmid else r.source), review=r.review) for r in refs]
+        first_pmid = next((r.pmid or r.pdf_pmid for r in refs if r.pmid or r.pdf_pmid), None)
         s = Session(owner=owner, pmid=first_pmid, focus=spec.focus, partner=spec.partner, pathway_id=spec.pathway_id,
                     papers=papers,
                     source=source_label or self._source_label(papers))
@@ -115,9 +119,18 @@ class SessionService:
             s = self.store.get(session_id, owner)
             s.draft, s.evidence, s.paper = result.draft, result.evidence, result.paper
             s.paper_texts = dict(result.papers)
+            for p in s.papers:                                 # review or research, as decided for the run
+                if p.source in result.reviews:
+                    p.review = result.reviews[p.source]
             s.existing, s.issues = list(result.existing), list(result.issues)
             s.usage, s.usage_source = list(result.usage), 'saved' if result.replayed else 'run'
+            for p in s.papers:                                 # a PDF's PubMed ID: its reactions cite it
+                if p.kind == 'pdf' and p.pmid:
+                    self.cite_paper(s, p.source, p.pmid)
             self.refresh(s)
+            if self.auto_qa and self.qa_model is not None and not result.replayed and s.draft.reactions:
+                progress(f'checking each reaction ({len(s.draft.reactions)})')
+                self.qa_into(s, self.qa_model, self.qa_workers)
             self.refresh_suggestions(s)
             s.status, s.progress, s.error = 'ready', 'done', None
             s.change_log.append(ChangeLogEntry(actor='pipeline', action='created',
@@ -130,22 +143,135 @@ class SessionService:
         self.store.save(s)
         return session_id
 
+    def cite_paper(self, s: Session, source: str, pmid: str, old: Optional[str] = None) -> int:
+        """Make the reactions from paper `source` cite `pmid` (replacing `old`, unless another paper of the session has
+        that ID too): their pmids, their quotes' pmid and the pathways listing them. The LiteratureReference is the
+        existing one in Reactome when there is one (resolver), else a new one the front-end fills in from PubMed.
+        Returns how many reactions now cite it; `s` is not saved here."""
+        d = s.draft
+        if d is None:
+            return 0
+        if len(s.papers) <= 1:
+            ev_ids = {e.id for e in s.evidence}
+        else:
+            ev_ids = {e.id for e in s.evidence if e.source == source}
+        keep_old = old and any(p.pmid == old for p in s.papers if p.source != source)
+        for e in s.evidence:
+            if e.id in ev_ids:
+                e.pmid = pmid
+        keys = set()
+        for r in d.reactions:
+            if len(s.papers) <= 1 or ev_ids.intersection(r.evidence_ids):
+                r.pmids = [m for m in r.pmids if m != old or keep_old]
+                if pmid not in r.pmids:
+                    r.pmids.append(pmid)
+                keys.add(r.key)
+        if d.pathway is not None:
+            for _, pw in d.pathway.walk():
+                if keys.intersection(pw.reactions) or (pw is d.pathway and keys):
+                    pw.pmids = [m for m in pw.pmids if m != old or keep_old]
+                    if pmid not in pw.pmids:
+                        pw.pmids.append(pmid)
+        if old and not keep_old:
+            d.publications.pop(old, None)
+        if pmid not in d.publications and self.resolver_factory:
+            try:
+                ref = self.resolver_factory().publication(pmid)
+            except Exception:                                  # the graph unreachable: a new reference is fine
+                ref = None
+            if ref:
+                d.publications[pmid] = ref
+        return len(keys)
+
+    @_locked
+    def set_paper_pmid(self, owner: str, session_id: str, source: str, pmid: Optional[str]) -> Session:
+        """Give an uploaded PDF its PubMed ID after the fact (or correct it): the paper, its reactions, their quotes and
+        pathways get it, and the 'no PubMed ID' issue goes. `pmid` None or '' takes it away again."""
+        s = self._ready(owner, session_id)
+        paper = next((p for p in s.papers if p.source == source), None)
+        if paper is None:
+            raise ProposalError(f'no paper {source!r} in this annotation')
+        if paper.kind != 'pdf':
+            raise ProposalError(f'{paper.name} came from PubMed; its PubMed ID cannot be changed')
+        old, new = paper.pmid, (pmid or '').strip() or None
+        if new == old:
+            return s
+        if new is None:
+            self._uncite_paper(s, source, old)
+        else:
+            self.cite_paper(s, source, new, old=old)
+        paper.pmid = new
+        if len(s.papers) == 1:
+            s.pmid = new
+        s.change_log.append(ChangeLogEntry(actor=owner, action='set pubmed id',
+                                           detail=f'{paper.name}: {old or "none"} -> {new or "none"}'))
+        self.refresh(s)
+        self.refresh_suggestions(s)
+        self.store.save(s)
+        return s
+
+    @staticmethod
+    def _uncite_paper(s: Session, source: str, old: Optional[str]) -> None:
+        if not old or s.draft is None or any(p.pmid == old for p in s.papers if p.source != source):
+            return
+        for r in s.draft.reactions:
+            r.pmids = [m for m in r.pmids if m != old]
+        if s.draft.pathway is not None:
+            for _, pw in s.draft.pathway.walk():
+                pw.pmids = [m for m in pw.pmids if m != old]
+        s.draft.publications.pop(old, None)
+        for e in s.evidence:
+            if e.source == source or len(s.papers) <= 1:
+                e.pmid = None
+
+    @staticmethod
+    def reviews_of(s: Session) -> List[str]:
+        """Source tags of the session's papers that are review articles (their cited statements are their evidence)."""
+        return [p.source for p in s.papers if p.review]
+
+    @staticmethod
+    def qa_into(s: Session, model, workers: int = 8) -> list:
+        """QA every reaction of `s` (model calls concurrent) and put the findings into its issues; `s` is not saved here.
+        Returns the results, most urgent first."""
+        reviews = SessionService.reviews_of(s)
+        keys = [r.key for r in s.draft.reactions]
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keys) or 1))) as pool:
+            results = list(pool.map(lambda k: qa_reaction(s.draft, k, s.evidence, model, reviews), keys))
+        for res in results:
+            SessionService._merge_qa(s, res, model)
+        iss.organize(s.issues, s.draft, s.proposals)
+        return rank_results(results)
+
     @staticmethod
     def refresh(s: Session) -> None:
         """Re-emit instances from the draft and rebuild the issue list. Emitter issues are replaced on every
         refresh; issues that recur keep the id and status they had."""
         key = lambda i: (i.code, i.message, i.reaction_key, i.participant_key)
-        kept = [i for i in s.issues if i.source not in ('emitter', 'checks')]
+        alive = {r.key for r in s.draft.reactions}
+        for k in [k for k in s.qa if k not in alive]:              # a removed reaction takes its QA with it
+            del s.qa[k]
+        kept = [i for i in s.issues if i.source not in ('emitter', 'checks')
+                and (i.reaction_key is None or i.reaction_key in alive)]
         emit = emit_user_instances(s.draft, {e.id: e for e in s.evidence})
         s.user_instances, s.evidence_links, s.key_to_db_id = emit.user_instances, emit.evidence_links, emit.key_to_db_id
+        s.participant_to_db_id = emit.participant_to_db_id
         have = {(i.code, i.participant_key) for i in kept}
         merged = kept + [f for f in iss.issues_from_draft(s.draft) if (f.code, f.participant_key) not in have]
         merged += iss.issues_from_notes('emitter', emit.warnings)
         merged += [Issue(source='checks', severity=f.severity, code=f.code, message=f.message, reaction_key=k)
-                   for k, f in auto_findings(s.draft)]
+                   for k, f in auto_findings(s.draft, s.evidence, SessionService.reviews_of(s))]
+        if not SessionService._has_pmid(s) and any(not r.pmids for r in s.draft.reactions):
+            merged.append(Issue(source='checks', severity='warning', code='paper_no_pmid',
+                                message='the paper has no PubMed ID, so no reaction has a literature reference: add it to '
+                                        'the reactions once the paper is in PubMed'))
         iss.link_to_instances(merged, emit.key_to_db_id, emit.participant_to_db_id)
         _carry_over(s.issues, merged, key)
         s.issues = iss.assign_ids(merged)
+        iss.organize(s.issues, s.draft, s.proposals)
+
+    @staticmethod
+    def _has_pmid(s: Session) -> bool:
+        return bool(s.pmid or any(p.pmid for p in s.papers))
 
     # ── proposals ──────────────────────────────────────────────────────────
     @staticmethod
@@ -245,7 +371,7 @@ class SessionService:
         """Make the suggested fixes for the draft as it is now, as pending proposals (actor 'suggestions'). A pending one
         that no longer applies, or no longer fixes anything, is dropped; one the curator already accepted or rejected
         is not made again."""
-        wanted = make_suggestions(s.draft, s.evidence)
+        wanted = make_suggestions(s.draft, s.evidence, self.reviews_of(s), s.issues)
         same = lambda p, ops: p.ops == ops
         s.proposals = [p for p in s.proposals
                        if not (p.actor == self.SUGGESTER and p.status == 'pending' and not any(same(p, w.ops) for w in wanted))]
@@ -257,6 +383,7 @@ class SessionService:
                 s.proposals.append(self._build_proposal(s, w.ops, w.reason, None, self.SUGGESTER, skip_evidence_check=True))
             except ProposalError as e:
                 logger.info('suggestion %s for %s not made: %s', w.code, w.reaction_key, e)
+        iss.organize(s.issues, s.draft, s.proposals)
 
     @_locked
     def suggest_fixes(self, owner: str, session_id: str) -> List[Proposal]:
@@ -281,6 +408,24 @@ class SessionService:
     def accept(self, owner: str, session_id: str, proposal_id: str) -> Session:
         """Apply a proposal: patch the draft, register its evidence, resolve what it introduced, re-emit."""
         s, p = self._pending(owner, session_id, proposal_id)
+        return self._apply(s, p, owner)
+
+    @_locked
+    def remove_reaction(self, owner: str, session_id: str, key: str, reason: str = '') -> Tuple[Session, Proposal]:
+        """The curator removes a reaction directly (the reaction panel's "Remove this reaction"). It goes through the same
+        path as accepting a proposal, so the change log, issues, QA, suggestions, other pending proposals and the emitted
+        instances all follow. Removing is the curator's own decision, so it needs no quote."""
+        s = self._ready(owner, session_id)
+        r = next((x for x in s.draft.reactions if x.key == key), None)
+        if r is None:
+            raise LookupError(f'no reaction with key {key!r}')
+        p = self._build_proposal(s, remove_reaction_ops(s.draft, key), reason or f'removed "{r.name}" ({key})', None,
+                                 owner, skip_evidence_check=True)
+        s.proposals.append(p)
+        return self._apply(s, p, owner), p
+
+    def _apply(self, s: Session, p: Proposal, owner: str) -> Session:
+        """Accept proposal `p` on session `s` (the caller holds the session's lock) and save."""
         try:
             new = apply_patch(s.draft, p.ops)
         except PatchError as e:                       # the draft changed since the proposal was made
@@ -302,8 +447,31 @@ class SessionService:
         self._recheck_existing(s, keys or None)
         p.status, p.decided_by, p.decided_at = 'accepted', owner, time.time()
         s.change_log.append(ChangeLogEntry(actor=owner, action=f'accepted {p.id}', detail='; '.join(p.summary)[:500]))
+        # another pending edit that no longer applies (say, a chat edit of a reaction just removed) is stale now, so it
+        # is not offered any more; suggestions are remade just below
+        for q in s.proposals:
+            if q.status == 'pending' and q is not p and q.actor != self.SUGGESTER:
+                try:
+                    apply_patch(s.draft, q.ops)
+                except PatchError:
+                    q.status, q.decided_by, q.decided_at = 'stale', owner, time.time()
         self.refresh_suggestions(s)
         self.store.save(s)
+        return s
+
+    @_locked
+    def delete(self, owner: str, session_id: str) -> Session:
+        """Delete a session (one annotation) for good, so the curator can start the papers again or tidy up their list.
+        Returns what was deleted (the caller removes its uploaded PDFs). A session still queued or running is refused:
+        its job lives on in the process and would save the session again when it finished, bringing it back."""
+        s = self.store.get(session_id, owner)
+        if s is None:
+            raise LookupError('no such session')
+        if s.status in ('queued', 'running'):
+            raise ProposalError('This annotation is still running. Wait until it finishes, then delete it.')
+        self.store.delete(session_id, owner)
+        with _locks_guard:
+            _locks.pop(session_id, None)
         return s
 
     @_locked
@@ -320,7 +488,7 @@ class SessionService:
         The model call runs outside the session lock, so chat and the UI are not held up while it waits."""
         s = self._ready(owner, session_id)
         try:
-            result = qa_reaction(s.draft, reaction_key, s.evidence, model)
+            result = qa_reaction(s.draft, reaction_key, s.evidence, model, self.reviews_of(s))
         except KeyError:
             raise ProposalError(f'no reaction with key {reaction_key!r}')
         return self._apply_qa(owner, session_id, result, model)
@@ -329,10 +497,10 @@ class SessionService:
         """QA every reaction (the model calls run concurrently), record the findings as issues, and return the
         results most urgent first."""
         s = self._ready(owner, session_id)
-        draft, evidence = s.draft, s.evidence
+        draft, evidence, reviews = s.draft, s.evidence, self.reviews_of(s)
         keys = [r.key for r in draft.reactions]
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(keys) or 1))) as pool:
-            results = list(pool.map(lambda k: qa_reaction(draft, k, evidence, model), keys))
+            results = list(pool.map(lambda k: qa_reaction(draft, k, evidence, model, reviews), keys))
         applied = []
         for res in results:
             try:
@@ -344,21 +512,35 @@ class SessionService:
     @_locked
     def _apply_qa(self, owner: str, session_id: str, result, model=None):
         s = self._ready(owner, session_id)
+        if not any(r.key == result.reaction_key for r in s.draft.reactions):
+            raise ProposalError(f'no reaction with key {result.reaction_key!r}')
+        self._merge_qa(s, result, model, actor=owner)
+        self.refresh_suggestions(s)                       # a reaction found not to be one gets a suggestion to remove it
+        self.store.save(s)
+        return result
+
+    @staticmethod
+    def _merge_qa(s: Session, result, model=None, actor: str = 'pipeline') -> None:
+        """Replace the reaction's QA issues with this result's (ids and statuses of recurring ones kept)."""
         reaction_key = result.reaction_key
-        if not any(r.key == reaction_key for r in s.draft.reactions):
-            raise ProposalError(f'no reaction with key {reaction_key!r}')
         mine = lambda i: i.source == 'qa' and i.reaction_key == reaction_key
+        no_pmid = not SessionService._has_pmid(s)            # then 'paper_no_pmid' says it once, not per reaction
         fresh = [Issue(source='qa', severity=f.severity, code=f.code, message=f.message, reaction_key=reaction_key,
-                       instance_db_id=s.key_to_db_id.get(reaction_key))
-                 for f in result.findings if f.code not in AUTO_RULE_CODES]   # those are 'checks' issues already
+                       instance_db_id=s.key_to_db_id.get(reaction_key), field=f.field)
+                 for f in result.findings if f.code not in AUTO_RULE_CODES   # those are 'checks' issues already
+                 and not (no_pmid and f.code == 'qa_no_literature_reference')]
+        if result.is_reaction is False:
+            fresh.insert(0, Issue(source='qa', severity='action', code='qa_not_a_reaction', reaction_key=reaction_key,
+                                  instance_db_id=s.key_to_db_id.get(reaction_key),
+                                  message='not a molecular reaction: ' + (result.not_reaction_reason or 'see the QA summary')))
+        s.qa[reaction_key] = ReactionQA(priority=result.priority, summary=result.summary, score=result.score,
+                                        is_reaction=result.is_reaction)
         _carry_over([i for i in s.issues if mine(i)], fresh, lambda i: (i.code, i.message, i.reaction_key))
         s.issues = iss.assign_ids([i for i in s.issues if not mine(i)] + fresh)
         if result.usage:
             s.usage.append(UsageEntry(step='qa', calls=1, detail=reaction_key, model=getattr(model, 'model', None),
                                       **result.usage))
-        s.change_log.append(ChangeLogEntry(actor=owner, action=f'qa {reaction_key}', detail=result.verdict))
-        self.store.save(s)
-        return result
+        s.change_log.append(ChangeLogEntry(actor=actor, action=f'qa {reaction_key}', detail=result.verdict))
 
     @_locked
     def check_existing(self, owner: str, session_id: str, only: Optional[List[str]] = None) -> Session:

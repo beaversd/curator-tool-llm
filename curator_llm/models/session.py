@@ -14,7 +14,7 @@ class Issue(BaseModel):
     """Something a curator must look at. Every note the pipeline produces becomes one of these, so the
     frontend can list them all in one place instead of burying them in logs."""
     id: str = ''
-    source: Literal['evidence', 'builder', 'resolver', 'emitter', 'pipeline', 'existing', 'qa', 'checks']
+    source: Literal['evidence', 'builder', 'resolver', 'emitter', 'pipeline', 'existing', 'qa', 'checks', 'compartments']
     severity: Literal['info', 'warning', 'action'] = 'warning'
     code: str                                  # stable machine-readable kind, e.g. 'needs_resolution:uniprot'
     message: str
@@ -22,6 +22,23 @@ class Issue(BaseModel):
     participant_key: Optional[str] = None
     instance_db_id: Optional[int] = None       # filled once instances are emitted
     status: Literal['open', 'resolved', 'dismissed'] = 'open'
+    field: Optional[str] = None                # the part of the reaction it is about (catalyst, inputs, summation, ...)
+    # Filled by issues.organize, so a curator sees what to decide first:
+    #   category: keep (should this reaction exist at all) | existing (already in Reactome) | content (participants,
+    #             catalyst, regulation) | identifiers | evidence (quotes, summation, references) | paper | other
+    #   blocked_by: the open "keep this reaction?" issue this one waits on; listed once the reaction is kept
+    #   proposal_id: a pending suggested fix that resolves it
+    category: str = 'other'
+    blocked_by: Optional[str] = None
+    proposal_id: Optional[str] = None
+
+
+class ReactionQA(BaseModel):
+    """The last QA review of one reaction: where it goes in the curator's list."""
+    priority: str = 'ok'                       # fix_first | fix | review | ok
+    summary: Optional[str] = None
+    score: Optional[float] = None
+    is_reaction: Optional[bool] = None         # the model's answer to "is this a molecular reaction at all"
 
 
 class Proposal(BaseModel):
@@ -74,6 +91,8 @@ class PaperInfo(BaseModel):
     kind: Literal['pmid', 'pdf'] = 'pmid'
     pmid: Optional[str] = None
     name: str = ''                              # what to show: the PMID or the uploaded file's name
+    review: Optional[bool] = None               # annotated as a review article (reactions it only cites were kept);
+                                                # None until decided (a PMID's kind is read from PubMed when it runs)
 
 
 class Session(BaseModel):
@@ -92,9 +111,11 @@ class Session(BaseModel):
     draft: Optional[ReactomeDraft] = None
     evidence: List[Evidence] = Field(default_factory=list)
     issues: List[Issue] = Field(default_factory=list)
+    qa: Dict[str, ReactionQA] = Field(default_factory=dict)   # reaction key -> its last QA review
     user_instances: Optional[dict] = None
     evidence_links: List[dict] = Field(default_factory=list)
     key_to_db_id: Dict[str, int] = Field(default_factory=dict)
+    participant_to_db_id: Dict[str, int] = Field(default_factory=dict)   # participant key -> dbId in user_instances
     change_log: List[ChangeLogEntry] = Field(default_factory=list)
     paper: Optional[dict] = None                # PaperText.to_dict() of the first paper (kept for older sessions)
     papers: List[PaperInfo] = Field(default_factory=list)        # every paper of the session, in order

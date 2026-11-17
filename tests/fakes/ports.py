@@ -43,6 +43,28 @@ class FakeInstanceLookup:
         return next((i for i in self.instances if i['dbId'] == db_id), None)
 
 
+class FakeReactomeGraph:
+    """ReactomeGraph from tables: names (search), instances by dbId/stId, entities/events by identifier."""
+
+    def __init__(self, names=(), instances=None, entities=None, events=None):
+        self.names, self.instances = list(names), instances or {}
+        self.entities, self.events, self.calls = entities or {}, events or {}, []
+
+    def search_reactome(self, text, kind='any', species='Homo sapiens', limit=15):
+        self.calls.append(('search', text, kind, species))
+        return [r for r in self.names if text.lower() in r['displayName'].lower()][:limit]
+
+    def reactome_instance(self, ident):
+        self.calls.append(('instance', ident))
+        return self.instances.get(str(ident))
+
+    def entities_of(self, identifier, limit=25):
+        return self.entities.get(identifier, [])
+
+    def events_of(self, identifier, limit=25):
+        return self.events.get(identifier, [])
+
+
 class FakeUniProt:
     def __init__(self, entries: Dict[str, Dict], genes: Optional[Dict[str, str]] = None):
         self.entries, self.genes = entries, genes or {}
@@ -51,7 +73,8 @@ class FakeUniProt:
         return self.entries.get(accession.upper())
 
     def search_gene(self, symbol, taxon=9606):
-        return self.genes.get(symbol)
+        self.searches = getattr(self, 'searches', []) + [(symbol, taxon)]
+        return self.genes.get(symbol) if taxon == 9606 else self.genes.get((symbol, taxon))
 
 
 class FakeOntology:
@@ -81,6 +104,40 @@ class SyncJobRunner:
     def get(self, job_id, owner):
         job = self.jobs.get(job_id)
         return job if job and job.owner == owner else None
+
+
+class FakePubMed:
+    """PubMed publication types by PMID; `fail` makes every call raise, as an unreachable PubMed would. With `articles`
+    ({pmid: {'title': ..., 'doi': ...}}) it also searches (ArticleSearch): '"<doi>"[doi]' finds by DOI, 'w[Title] AND
+    ...' finds titles holding every word; `queries` records the searches."""
+
+    def __init__(self, types: Optional[Dict[str, List[str]]] = None, fail: bool = False,
+                 articles: Optional[Dict[str, Dict[str, str]]] = None):
+        self.types, self.fail, self.calls = types or {}, fail, []
+        self.articles, self.queries = articles or {}, []
+
+    def search(self, term, limit=5):
+        import re
+        self.queries.append(term)
+        if self.fail:
+            raise ConnectionError('PubMed is down')
+        m = re.fullmatch(r'"(.+)"\[doi\]', term)
+        if m:
+            return [p for p, a in self.articles.items() if a.get('doi', '').lower() == m.group(1).lower()][:limit]
+        words = re.findall(r'(\w+)\[Title\]', term)
+        norm = lambda t: re.sub(r'[^a-z0-9]+', ' ', t.lower()).split()
+        return [p for p, a in self.articles.items() if words and all(w in norm(a['title']) for w in words)][:limit]
+
+    def titles(self, pmids):
+        if self.fail:
+            raise ConnectionError('PubMed is down')
+        return {p: self.articles[p]['title'] for p in pmids if p in self.articles}
+
+    def publication_types(self, pmids):
+        self.calls.append(list(pmids))
+        if self.fail:
+            raise ConnectionError('PubMed is down')
+        return {p: self.types[p] for p in pmids if p in self.types}
 
 
 class FakePaperFinder:

@@ -1,11 +1,14 @@
 """FastAPI app factory. Auth is a router-level dependency, so no route can be added without it, and
 every session read goes through the owner check in the store."""
+import dataclasses
+import json
 import os
 import re
+import tempfile
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -19,6 +22,7 @@ from curator_llm.ports.pathway_finder import PathwayFinder
 from curator_llm.ports.pipeline import PaperRef, Pipeline, PipelineInput
 from curator_llm.ports.sessions import SessionStore
 from curator_llm.services.network import build_network
+from curator_llm.services import issues as iss
 from curator_llm.services.session_service import ProposalError, SessionService
 
 
@@ -34,6 +38,14 @@ def current_user(request: Request) -> AuthUser:
         raise HTTPException(401, str(e))
 
 
+def equation(draft, r) -> str:
+    """'CDK1:Cyclin B -> CDK1(pTyr15):Cyclin B (catalyst WEE1)': tells apart reactions that share a name."""
+    name = lambda k: draft.participants[k].name if k in draft.participants else k
+    side = lambda keys: ' + '.join(name(k) for k in keys) or 'nothing'
+    cat = f' (catalyst {name(r.catalyst.entity)})' if r.catalyst else ''
+    return f'{side(r.inputs)} -> {side(r.outputs)}{cat}'
+
+
 class StartRequest(BaseModel):
     pmid: Optional[str] = None                       # one paper ...
     pmids: List[str] = Field(default_factory=list)   # ... or several: merged into ONE draft, across papers
@@ -42,6 +54,10 @@ class StartRequest(BaseModel):
     # and the predicted pathway (dbId) the draft is placed in.
     partner: Optional[str] = None
     pathway_id: Optional[int] = Field(None, gt=0)
+    # Review articles keep the reactions they only cite; a research paper keeps only what its own results show (Reactome
+    # needs direct evidence), and what it only cites is listed in the issues. Leave it out and each PMID's kind is read
+    # from PubMed; true or false overrides that for every paper.
+    review: Optional[bool] = None
 
 
 class GeneSearchRequest(BaseModel):
@@ -77,6 +93,32 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024           # per PDF
 MAX_PAPERS = 10                                # per session, unless create_app is given another limit
 
 
+class PaperPmidRequest(BaseModel):
+    source: str                                  # the paper's source tag (Session.papers[].source)
+    pmid: Optional[str] = None                   # its PubMed ID; empty or null takes it away
+
+
+def parse_pdf_pmids(raw: Optional[str]) -> Dict[str, str]:
+    """{file name: PubMed ID} from the upload's `pdf_pmids` field (a JSON object); 422 on anything else. An empty ID
+    means none."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise HTTPException(422, 'pdf_pmids must be a JSON object of file name -> PubMed ID')
+    if not isinstance(data, dict):
+        raise HTTPException(422, 'pdf_pmids must be a JSON object of file name -> PubMed ID')
+    out = {}
+    for name, pmid in data.items():
+        pmid = str(pmid or '').strip()
+        if pmid and not pmid.isdigit():
+            raise HTTPException(422, f'{name}: {pmid!r} is not a PubMed ID')
+        if pmid:
+            out[str(name)] = pmid
+    return out
+
+
 class ChatRequest(BaseModel):
     message: str
     selectedDbIds: List[int] = Field(default_factory=list)
@@ -107,14 +149,19 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                pipeline: Optional[Pipeline] = None, resolver_factory=None,
                upload_dir: Optional[str] = None, cors_origins: Optional[List[str]] = None,
                chat_model=None, events=None, qa_model=None, max_papers: int = MAX_PAPERS,
+               auto_qa: bool = False, article_search=None, graph=None,
                paper_finder: Optional[PaperFinder] = None,
                pathway_finder: Optional[PathwayFinder] = None) -> FastAPI:
+    """`graph` (ports.graph.ReactomeGraph) gives the chat read-only Reactome lookups; without it the chat has none.
+    `article_search` (ports.external.ArticleSearch, PubMed) finds the PubMed ID of an uploaded PDF and checks one a
+    curator types; without it, PDFs simply have none until a curator gives it."""
     app = FastAPI(title='curator-tool-llm')
     if cors_origins:
         app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True,
                            allow_methods=['*'], allow_headers=['Authorization', 'Content-Type'])
     app.state.auth = auth
-    service = SessionService(store, jobs, pipeline, resolver_factory, events) if store and jobs and pipeline else None
+    service = (SessionService(store, jobs, pipeline, resolver_factory, events, qa_model=qa_model or chat_model,
+                              auto_qa=auto_qa) if store and jobs and pipeline else None)
     app.state.service, app.state.store, app.state.jobs = service, store, jobs
     router = APIRouter(prefix='/api/llm', dependencies=[Depends(current_user)])
 
@@ -148,7 +195,7 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         partner = (req.partner or '').strip().upper() or None
         if partner and not (focus and _GENE.fullmatch(partner)):
             raise HTTPException(422, 'a partner needs a focus gene' if not focus else f'not a gene symbol: {req.partner!r}')
-        extra = {'focus': focus, 'partner': partner, 'pathway_id': req.pathway_id}
+        extra = {'focus': focus, 'partner': partner, 'pathway_id': req.pathway_id, 'review': req.review}
         spec = (PipelineInput(pmid=pmids[0], **extra) if len(pmids) == 1 else
                 PipelineInput(papers=[PaperRef(pmid=p) for p in pmids], **extra))
         sid, jid = svc().start(user.username, spec)
@@ -192,10 +239,15 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
     @router.post('/sessions/upload', status_code=202)
     async def upload(file: Optional[UploadFile] = File(None), files: Optional[List[UploadFile]] = File(None),
                      pmids: Optional[str] = Form(None), focus: Optional[str] = Form(None),
-                     user: AuthUser = Depends(current_user)):
+                     review: Optional[bool] = Form(None), review_files: Optional[List[str]] = Form(None),
+                     pdf_pmids: Optional[str] = Form(None), user: AuthUser = Depends(current_user)):
         """Annotate papers that are not (all) in PubMed Central: upload PDFs. Send one in `file` (as before), or several
         in `files`, and optionally add PubMed IDs in `pmids` (comma or space separated). With more than one paper in all,
-        they are merged into ONE draft, across papers."""
+        they are merged into ONE draft, across papers. A PDF named in `review_files` (one field per file name, as uploaded) is a
+        review article; any other PDF is research. Each PMID's kind is read from PubMed. `review=true|false` overrides
+        both for every paper (see StartRequest). `pdf_pmids` gives a PDF its PubMed ID, as a JSON object of file name (as
+        uploaded) -> PMID (see POST /papers/identify): the text still comes from the PDF, its reactions cite the ID,
+        and PubMed decides whether it is a review."""
         if not upload_dir:
             raise HTTPException(503, 'uploads are not configured')
         sent = [f for f in ([file] if file else []) + list(files or []) if f is not None and (f.filename or f.size)]
@@ -204,6 +256,17 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
             raise HTTPException(422, 'upload at least one PDF, or give pmids')
         if len(sent) + len(ids) > max_papers:
             raise HTTPException(422, f'at most {max_papers} papers per session')
+        reviews = {n for n in (review_files or []) if n}
+        given = parse_pdf_pmids(pdf_pmids)
+        if given and article_search is not None:             # a typo would make the reactions cite another paper
+            try:
+                known = article_search.titles(sorted(set(given.values())))
+            except Exception:                                # PubMed unreachable: trust the curator
+                known = None
+            if known is not None:
+                for name, pmid in given.items():
+                    if pmid not in known:
+                        raise HTTPException(422, f'{name}: PubMed has no record of PMID {pmid}')
         folder = os.path.join(upload_dir, _safe_name(user.username))
         os.makedirs(folder, exist_ok=True)
         refs: List[PaperRef] = []
@@ -220,7 +283,8 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                 with open(path, 'wb') as out:
                     out.write(data)
                 saved.append(path)
-                refs.append(PaperRef(pdf_path=path, label=label))
+                refs.append(PaperRef(pdf_path=path, label=label, review=True if f.filename in reviews else None,
+                                     pdf_pmid=given.get(f.filename) or given.get(label)))
         except HTTPException:
             for p in saved:                                # a refused request leaves nothing behind
                 try:
@@ -229,12 +293,89 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                     pass
             raise
         refs += [PaperRef(pmid=p) for p in ids]
+        if review is not None:                             # the request-wide setting overrides the per-file one
+            refs = [dataclasses.replace(r, review=review) for r in refs]
         if len(refs) == 1 and refs[0].pdf_path:            # one PDF: exactly as before
-            sid, jid = svc().start(user.username, PipelineInput(pdf_path=refs[0].pdf_path, focus=focus or None),
+            sid, jid = svc().start(user.username, PipelineInput(pdf_path=refs[0].pdf_path, focus=focus or None,
+                                                                review=refs[0].review, pdf_pmid=refs[0].pdf_pmid),
                                    source_label=refs[0].label)
         else:
             sid, jid = svc().start(user.username, PipelineInput(papers=refs, focus=focus or None))
         return {'sessionId': sid, 'jobId': jid}
+
+    @router.post('/papers/identify')
+    def identify_paper(file: UploadFile = File(...), user: AuthUser = Depends(current_user)):
+        """Find the PubMed ID of the article in a PDF, before uploading it for annotation: by the DOI on its first pages,
+        else by its title (services/paper_identity). The PDF is not kept. Answers {found, pmid, title, method: doi|title,
+        doi}; found false when nothing matched (a preprint, a paper not in PubMed, a scan) or PubMed could not be asked
+        (`note` says which). A suggestion for the curator to confirm, never applied by itself."""
+        if article_search is None:
+            raise HTTPException(503, 'PubMed search is not configured')
+        data = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f'the PDF is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB')
+        if not data.startswith(b'%PDF-'):
+            raise HTTPException(422, 'the file is not a PDF')
+        from curator_llm.services.paper_identity import identify
+        with tempfile.NamedTemporaryFile(suffix='.pdf') as tmp:
+            tmp.write(data)
+            tmp.flush()
+            try:
+                hit = identify(tmp.name, article_search)
+            except Exception as e:                       # PubMed down, or a PDF PyMuPDF cannot read
+                return {'found': False, 'note': f'could not check ({type(e).__name__}: {e})'}
+        if not hit:
+            return {'found': False, 'note': 'no DOI or title on its first page matched a PubMed record'}
+        return {'found': True, **hit}
+
+    class PaperSourceRequest(BaseModel):
+        source: str
+
+    @router.post('/sessions/{session_id}/papers/identify')
+    def identify_session_paper(session_id: str, req: PaperSourceRequest, user: AuthUser = Depends(current_user)):
+        """As POST /papers/identify, for a PDF already uploaded in this annotation (one made before its PubMed ID was
+        known). A suggestion to confirm with PUT .../papers/pmid; nothing changes here."""
+        s = load(session_id, user)
+        paper = next((p for p in s.papers if p.source == req.source), None)
+        if paper is None or paper.kind != 'pdf':
+            raise HTTPException(404, f'no uploaded PDF {req.source!r} in this annotation')
+        if article_search is None:
+            raise HTTPException(503, 'PubMed search is not configured')
+        path = os.path.join(upload_dir or '', _safe_name(user.username), os.path.basename(paper.source))
+        if not upload_dir or not os.path.isfile(path):
+            raise HTTPException(404, 'the uploaded PDF is no longer on the server')
+        from curator_llm.services.paper_identity import identify
+        try:
+            hit = identify(path, article_search)
+        except Exception as e:
+            return {'found': False, 'note': f'could not check ({type(e).__name__}: {e})'}
+        if not hit:
+            return {'found': False, 'note': 'no DOI or title on its first page matched a PubMed record'}
+        return {'found': True, **hit}
+
+    @router.put('/sessions/{session_id}/papers/pmid')
+    def set_paper_pmid(session_id: str, req: PaperPmidRequest, user: AuthUser = Depends(current_user)):
+        """Give an uploaded PDF its PubMed ID (or change or remove it): the paper, its reactions, their quotes and
+        pathways cite it, and the 'no PubMed ID' issue goes. PubMed must know the ID (checked when it can be asked).
+        Answers the papers and the title PubMed has for the ID."""
+        load(session_id, user)
+        pmid = (req.pmid or '').strip()
+        if pmid and not pmid.isdigit():
+            raise HTTPException(422, f'{pmid!r} is not a PubMed ID')
+        title = None
+        if pmid and article_search is not None:
+            try:
+                title = article_search.titles([pmid]).get(pmid)
+            except Exception:                            # PubMed unreachable: trust the curator
+                title = None
+            else:
+                if title is None:
+                    raise HTTPException(422, f'PubMed has no record of PMID {pmid}')
+        try:
+            s = svc().set_paper_pmid(user.username, session_id, req.source, pmid or None)
+        except ProposalError as e:
+            raise HTTPException(404 if 'no paper' in str(e) else 409, str(e))
+        return {'papers': [p.model_dump() for p in s.papers], 'title': title}
 
     @router.get('/sessions')
     def list_sessions(user: AuthUser = Depends(current_user)) -> List[SessionSummary]:
@@ -245,11 +386,35 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         s = load(session_id, user)
         out = SessionSummary.of(s).model_dump()
         out.update({'focus': s.focus, 'partner': s.partner, 'pathway_id': s.pathway_id, 'error': s.error,
+                    'qa': {k: v.model_dump() for k, v in s.qa.items()},
                     'papers': [p.model_dump() for p in s.papers] or [
                         PaperInfo(source=s.source, kind='pmid' if s.pmid else 'pdf', pmid=s.pmid, name=s.source).model_dump()],
                     'reactions': [{'key': r.key, 'name': r.name, 'dbId': s.key_to_db_id.get(r.key),
-                                   'evidenceIds': r.evidence_ids} for r in (s.draft.reactions if s.draft else [])]})
+                                   'evidenceIds': r.evidence_ids, 'equation': equation(s.draft, r)}
+                                  for r in (s.draft.reactions if s.draft else [])]})
         return out
+
+    @router.delete('/sessions/{session_id}', status_code=204)
+    def delete_session(session_id: str, user: AuthUser = Depends(current_user)):
+        """Delete one of the curator's sessions (annotations) for good, with the PDFs uploaded for it. 409 while it is
+        still queued or running."""
+        try:
+            s = svc().delete(user.username, session_id)
+        except LookupError:
+            raise HTTPException(404, 'no such session')
+        except ProposalError as e:
+            raise HTTPException(409, str(e))
+        if upload_dir:
+            # An uploaded PDF's source is its stored file name (<random>_<name>.pdf, unique to this upload) in the
+            # owner's upload folder. basename() keeps a hand-edited source from pointing anywhere else.
+            folder = os.path.join(upload_dir, _safe_name(user.username))
+            for paper in s.papers:
+                if paper.kind == 'pdf' and paper.source:
+                    try:
+                        os.remove(os.path.join(folder, os.path.basename(paper.source)))
+                    except OSError:
+                        pass                                   # already gone: the session is deleted all the same
+        return Response(status_code=204)
 
     @router.get('/sessions/{session_id}/issues')
     def issues(session_id: str, status: Optional[str] = None,
@@ -266,6 +431,7 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         if issue is None:
             raise HTTPException(404, 'no such issue')
         issue.status = body.status
+        iss.organize(s.issues, s.draft, s.proposals)          # deciding to keep a reaction lists its other issues again
         svc().store.save(s)
         return issue
 
@@ -303,6 +469,35 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         return {'reaction': r, 'dbId': s.key_to_db_id.get(key),
                 'participants': {k: s.draft.participants[k] for k in used if k in s.draft.participants},
                 'evidence': [by_id[i] for i in r.evidence_ids if i in by_id]}
+
+    @router.get('/sessions/{session_id}/entities')
+    def entities(session_id: str, user: AuthUser = Depends(current_user)):
+        """Every entity of the draft (the reactions' participants and their parts), in draft order: the participant as in
+        the draft, its dbId among the exported instances (negative: new; positive: an existing Reactome instance, shell
+        only), the reactions using it with its roles, and the complexes/sets containing it."""
+        s = load(session_id, user)
+        if s.draft is None:
+            raise HTTPException(409, f'session is {s.status}; no draft yet')
+        ids = s.participant_to_db_id
+        if not ids and s.draft.participants:          # saved before the mapping was kept: emitting again gives the same ids
+            from curator_llm.services.emitter import emit_user_instances
+            ids = emit_user_instances(s.draft, {e.id: e for e in s.evidence}).participant_to_db_id
+        roles: Dict[str, List[dict]] = {}
+        for r in s.draft.reactions:
+            mine: Dict[str, List[str]] = {}
+            for role, keys in (('input', r.inputs), ('output', r.outputs),
+                               ('catalyst', [r.catalyst.entity] if r.catalyst else []),
+                               ('regulator', [g.regulator for g in r.regulations])):
+                for k in keys:
+                    mine.setdefault(k, []).append(role)
+            for k, rs in mine.items():
+                roles.setdefault(k, []).append({'key': r.key, 'name': r.name, 'roles': list(dict.fromkeys(rs))})
+        parents: Dict[str, List[str]] = {}
+        for k, p in s.draft.participants.items():
+            for x in list(getattr(p, 'components', []) or []) + list(getattr(p, 'members', []) or []):
+                parents.setdefault(x, []).append(k)
+        return [{'key': k, 'participant': p, 'dbId': ids.get(k), 'reactions': roles.get(k, []),
+                 'partOf': list(dict.fromkeys(parents.get(k, [])))} for k, p in s.draft.participants.items()]
 
     @router.get('/sessions/{session_id}/network')
     def network(session_id: str, user: AuthUser = Depends(current_user)):
@@ -395,6 +590,22 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
                 'reactions': [{'key': r.key, 'name': r.name, 'dbId': s.key_to_db_id.get(r.key)} for r in s.draft.reactions],
                 'nOpenIssues': sum(i.status == 'open' for i in s.issues)}
 
+    @router.delete('/sessions/{session_id}/reactions/{key}')
+    def remove_reaction(session_id: str, key: str, user: AuthUser = Depends(current_user)):
+        """Remove one reaction from the draft, as the curator's own decision (no quote needed). Recorded as an accepted
+        proposal, so issues, QA, suggestions, other pending proposals and the emitted instances follow, exactly as when
+        a suggested removal is accepted. Same reply as accepting a proposal."""
+        load(session_id, user)
+        try:
+            s, p = svc().remove_reaction(user.username, session_id, key)
+        except LookupError:
+            raise HTTPException(404, f'no reaction with key {key!r}')
+        except ProposalError as e:
+            raise HTTPException(409, str(e))
+        return {'proposal': p,
+                'reactions': [{'key': r.key, 'name': r.name, 'dbId': s.key_to_db_id.get(r.key)} for r in s.draft.reactions],
+                'nOpenIssues': sum(i.status == 'open' for i in s.issues)}
+
     @router.post('/sessions/{session_id}/proposals/{proposal_id}/reject')
     def reject(session_id: str, proposal_id: str, user: AuthUser = Depends(current_user)):
         load(session_id, user)
@@ -420,7 +631,7 @@ def create_app(auth: AuthProvider, store: Optional[SessionStore] = None, jobs: O
         s = load(session_id, user)
         if s.status != 'ready':
             raise HTTPException(409, f'session is {s.status}; chat needs a ready session')
-        agent = ChatAgent(svc(), chat_model)
+        agent = ChatAgent(svc(), chat_model, graph=graph)
         events = agent.run(user.username, session_id, body.message, body.selectedDbIds)
 
         def sse():

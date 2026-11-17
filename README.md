@@ -318,7 +318,8 @@ Read from `.env` (the keys in [Configuration](#configuration-env) apply too):
 | Variable | Default | Meaning |
 |---|---|---|
 | `WS_BASE_URL` | `http://localhost:9090` | curator-tool-ws, which verifies tokens and roles. |
-| `SESSION_STORE` | `memory` | `memory`, or `mongo` to keep sessions across restarts (uses `PUBMED_MONGO_URI`). |
+| `SESSION_STORE` | `file` | Where sessions (one per annotation) are kept. `file`: one JSON file per session in a folder per user under `SESSION_DIR`, kept across restarts, nothing else needed. `mongo`: in MongoDB at `PUBMED_MONGO_URI`, also kept across restarts. `memory`: lost on restart, for development. |
+| `SESSION_DIR` | `data/sessions` | Where the file store keeps sessions: `<SESSION_DIR>/<username>/<session id>.json`. Back it up to back up every curator's annotations. |
 | `SNAPSHOT_MODE` | `record` | `record` saves every successful run, `replay` reuses a saved result instead of calling the models, `off` does neither. See [Fast iteration](#fast-iteration-without-calling-the-models). |
 | `SNAPSHOT_DIR` | `data/snapshots` | Where saved results go. |
 | `LLM_MODEL_<ROLE>` | see below | Model for one step, e.g. `LLM_MODEL_CHAT`. `CHAT_MODEL` still works. |
@@ -381,6 +382,90 @@ curl -s $API/sessions/SESSION_ID/instances/-5/evidence -H "$AUTH"
 
 Piping the output through `jq` makes it readable.
 
+### Research papers and review articles (direct evidence)
+
+Reactome annotates from direct evidence, so by default a paper is treated as **research**: only reactions its own
+results show are kept. A reaction whose every quote states earlier work ("WEE1 phosphorylates CDK1 on Tyr15
+(refs. 1–3)") is left out. The extractor tags each quote `this_paper` or `cited`, and code (not the prompt) applies the
+rule, in `curator_llm/services/direct_evidence.py`. What was left out is not lost: it is listed in an info issue
+(`cited_only_left_out`) and in `results/<stem>_cited_only.json`. A reaction with at least one quote from the paper's
+own data stays.
+
+A **review article** reports cited work by nature, so it keeps those reactions. Which papers are reviews:
+
+- **A PubMed ID**: PubMed's publication type decides ("Review", "Systematic Review", "Scoping Review",
+  "Meta-Analysis"), looked up when the annotation starts (`services/paper_kind.py`, one request for all of a session's
+  PMIDs). It matched all 8 papers of the ground-truth set; PMC's own article type did not. A PMID found to be a review
+  gets an info issue (`paper_is_review`). If PubMed cannot be reached, the paper is treated as research and an info
+  issue (`paper_kind_unknown`) says so.
+- **A PDF**: research, unless the curator ticks it as a review (the front-end has a "Review" box per PDF; over the API,
+  `review_files` in `POST /sessions/upload`, one form field per file name), or it has a PubMed ID (next section), in
+  which case PubMed decides as for a PMID.
+- **An override for every paper of a request**: `"review": true|false` in `POST /sessions`, `review=true|false` in the
+  upload form, `--review` for `scripts/annotate_papers.sh` and `run_extraction.py`.
+
+The session's paper list shows what was decided (`papers[].review`). A review and a research run of the same paper are
+saved as different snapshots.
+
+### The PubMed ID of an uploaded PDF
+
+A PDF's reactions can only cite the paper (a LiteratureReference, filled in from PubMed when loaded into the curator
+tool) if the paper's PubMed ID is known. The service finds it from the PDF itself (`services/paper_identity.py`): the DOI
+on its first two pages, looked up in PubMed and accepted only when PubMed's title for it is printed there (a DOI on page 1
+can be a cited paper's); otherwise the title (the largest text on page 1, or the PDF's title field), searched by its
+distinctive words and accepted when PubMed's title matches closely. Content beats the file name: a PDF named
+`39737163.pdf` may hold another paper. On 25 article PDFs it found every PubMed ID and none wrong; documents that are not
+articles gave nothing. Preprints, papers not yet in PubMed and scans without text get no ID.
+
+What is found is only offered; the curator keeps, edits or clears it:
+
+- **Before annotating**: the front-end looks each chosen PDF up (`POST /papers/identify`, the PDF is not kept) and shows
+  the ID under it, editable. It goes with the upload as `pdf_pmids` (a JSON object of file name -> PMID); an ID PubMed
+  does not know is refused (422). The text still comes from the PDF; the paper, its reactions, their quotes and pathways
+  cite the ID, and PubMed decides whether it is a review.
+- **Afterwards** (sessions made before, or a paper indexed later): "Set PubMed ID" next to the PDF in the annotation, with
+  "Find in PubMed" (`POST /sessions/{id}/papers/identify`, on the stored PDF). Saving (`PUT /sessions/{id}/papers/pmid`,
+  `{source, pmid}`; empty removes it) updates the reactions from that PDF and clears the `paper_no_pmid` issue.
+
+### Compartments, from the paper
+
+In Reactome every physical entity sits in a compartment and every reaction lists the compartments it happens in. Papers
+rarely say so in a field the extraction can fill (2 of 285 participants on four test papers), so after identifiers are
+resolved one more step (`services/compartments.py`) places each participant **in each reaction**, from what the text
+says. Code first finds the candidate passages: the sentences that name the participant (by its name, the paper's name,
+UniProt synonyms or Reactome's names) together with a location word, ranked for the reaction. The model then only decides
+which of those passages place it, and where; the passage is the recorded quote, and a participant with no passage is
+never placed. Example: "beta-catenin accumulates in the cytoplasm before translocating to the nucleus where
+it partners with TCF/LEF" puts beta-catenin in the nucleoplasm for that binding. Rules:
+
+- Evidence only. Each placement is *stated* (the text says or clearly implies it) or *shown* (an experiment places it),
+  with the passage it comes from. Without evidence nothing is set; a likely compartment from general knowledge is
+  offered as a suggested fix the curator can accept (it then counts as the curator's assertion), never applied.
+- A reaction can span compartments (a membrane receptor and a cytosolic partner, a translocation).
+- One molecule placed in different compartments in different reactions becomes separate entities, as in Reactome: the
+  reaction that places it elsewhere uses an existing participant of that molecule there ("CTNNB1 nuclear"), or a new one.
+- Reactome supplies only the names (its compartments in real use); the existing Reactome instance of a placed molecule is
+  then reused (by display name, else accession + compartment).
+
+On by default; `COMPARTMENTS=0` turns it off. About $0.1-0.2 per paper (only the passages are sent). The reaction panel
+shows each participant's compartment, how it was found and the passage.
+
+### Checks on every draft
+
+Every draft is checked before a curator sees it, and what the checks find is listed as issues; nothing is removed or
+changed without the curator:
+
+- **Automatic checks** (source `checks`, no model): a reaction whose every quote states earlier work (tagged cited, or
+  carrying a reference such as "(ref. 43)"; not for review articles), whose quotes stating a result are all negative
+  ("negligible", "did not") or all hedged ("may", "suggests"), whose quotes all come from Methods or describe a figure
+  panel ("Western blot showing ..."), or that looks like another reaction the merge left apart (same catalyst, mostly
+  the same inputs and outputs). For a cited-only or negative-only reaction a suggested fix proposes removing it.
+- **The model's QA review** of each reaction (source `qa`), run automatically after the pipeline (`AUTO_QA=1`, the
+  default; not for a replayed run; `--no-qa` on the command line). It asks first whether the reaction is a molecular
+  reaction at all (a cell-level outcome, a structural contact, a hypothesis, the reason for an experimental step, an
+  event of a tool or a negative result is not), then checks the catalyst, states, summation and evidence. It costs one
+  model call per reaction, run concurrently (30 reactions: about 30 seconds). `POST /sessions/{id}/qa` runs it again.
+
 ### Several papers in one session
 
 A session can take several papers (PubMed IDs and/or PDFs, up to `MAX_PAPERS`, default 10). Each paper is extracted on
@@ -402,9 +487,115 @@ scripts/annotate_papers.sh /path/to/pdf_folder --separate                       
 
 Per draft, in `--out` (default `./annotations`): `<name>.staged_instances.json` (what the curator tool's "load staged
 instances" takes), `<name>.issues.json`, `<name>.suggestions.json` (fixes suggested for some issues, as edits; none is
-applied), `<name>.session.json` (papers, counts, tokens used) and `<name>.evidence.json` (every quote with its paper, page and section). Finished results are skipped unless you pass `--force`; `--help` lists
-everything. What the script does not give you is the interactive side (chat, proposed edits, QA, the evidence viewer),
-which lives in the service and the front-end.
+applied), `<name>.session.json` (papers, counts, tokens used), `<name>.evidence.json` (every quote with its paper, page
+and section) and `<name>.annotation.json` (the whole annotation, see below). Finished results are skipped unless you
+pass `--force`; `--help` lists everything.
+
+#### Large runs: progress and resuming
+
+A run over many papers can be interrupted (a lost connection, a rate limit, a closed laptop). Run **the same command
+again** and it continues where it stopped:
+
+- Each paper's extraction ends with a status next to it (`results/<stem>_extraction.status.json`): `complete`,
+  `incomplete` (the model or PubMed Central could not be reached: worth another try) or `no_text` (not open access, or
+  no usable text: another try will not change it). A model call that fails is retried (waits `EXTRACT_RETRY_WAITS`,
+  default `5,20,60` seconds) before a chunk counts as failed, and a paper with a failed chunk is `incomplete`: it is
+  kept out of the draft and reported, instead of being used with reactions missing.
+- On the next run, a paper whose extraction is `complete` for the same paper, focus, review setting, model and prompt is
+  reused (`[resume]` in the log); the others are extracted. Changing the model or the prompt makes every paper extract
+  again. The merge's verdicts are cached too (`data/merge_cache`), so merging again is cheap.
+- `<name>.progress.json` in `--out` says how the run ended (`complete`, `partial`: written, but a paper is incomplete
+  or the merge failed, or `failed`) and lists each paper with its state and reason. Only a `complete` run is skipped
+  next time; the summary line and the exit code (1) say when something is left to do.
+- `--force` starts afresh: every paper is extracted again.
+- The REST service is not affected: it always extracts afresh. An incomplete run is never saved as a snapshot.
+
+```bash
+scripts/annotate_papers.sh --pmid-file pmids.txt --name big_run     # interrupted, or "partial"? run it again
+```
+
+#### Papers listed in a spreadsheet
+
+`scripts/annotate_spreadsheet.sh` annotates the papers an `.xlsx` lists (first sheet, or `--sheet NAME`; no Excel
+library needed). Per row: the PDF named in the **PDF File Name** column when there is one (looked for next to the
+spreadsheet and in its `pdf/` or `PDF/` folder, or `--pdf-dir`), otherwise the **PMID**, read from PubMed Central. The
+PMC full text is downloaded into a `PMC/` folder next to the spreadsheet (`<PMCID>.xml`, from the **PMCID** column or
+looked up; `--pmc-dir` to change it) and the workflow reads it from there. Column names can be changed
+(`--pmid-column`, `--pmcid-column`, `--pdf-column`, `--id-column`).
+
+```bash
+scripts/annotate_spreadsheet.sh papers.xlsx --list              # what would be done (PDF or PMC per row); changes nothing
+scripts/annotate_spreadsheet.sh papers.xlsx --download-only     # just the PMC full text, into PMC/
+scripts/annotate_spreadsheet.sh papers.xlsx --rows 1-5 --no-qa  # try a few rows first
+scripts/annotate_spreadsheet.sh papers.xlsx --jobs 3            # everything, 3 annotations at a time
+scripts/annotate_spreadsheet.sh papers.xlsx --group-by "Drug(s)"   # one merged annotation per drug instead of per paper
+```
+
+Results go to `annotations/` next to the spreadsheet (`--out`): each annotation's result files (named
+`<row>_pmid<PMID>`, in sheet order) and `summary.tsv`, one line per spreadsheet row: PDF or PMC, whether the full text
+came, the annotation, how its run ended (`complete`, `no_reactions`, `partial`, `failed`), the paper's state and the
+number of reactions. It resumes like the command line (see above): run the same command again after a stop. `--owner
+USER` adds each annotation to that curator's annotations for the front-end. PMC sometimes gives only an article's
+metadata ("the publisher does not allow downloading of the full text in XML form"): such rows say so in the summary;
+add their PDF to the spreadsheet to annotate them.
+
+**Token usage and cost**: `summary.tsv` also has, per annotation, the model calls, input/output/cache-read/cache-write
+tokens and an estimated cost in USD (on the first row of an annotation holding several papers), a row for combining
+the hierarchy, and a `TOTAL` row. It is rewritten after each annotation finishes, and the log prints `[cost] ... so far
+~$X`. Prices are in `curator_llm/pricing.py` (Anthropic list prices; override with `LLM_PRICES`, a JSON object of model
+-> `{"input", "output", "cache_write", "cache_read"}` per million tokens). These are estimates: the Anthropic Console
+has the bill.
+
+**One pathway hierarchy for the whole spreadsheet** (`--hierarchy`): after annotating each paper, the script also
+makes ONE annotation of them all, with a top pathway (`--title`, default the spreadsheet's name), a sub-pathway per
+`--group-by` value (say, per drug), and under it a pathway per paper, named by its title (`--title-column`, default
+`Title`). It is put together in code from the finished per-paper annotations, so nothing is extracted again: entities
+are shared (one BCL2, one venetoclax), and a reaction that several papers of a group report becomes one reaction citing
+all of them, listed under each of their pathways (the merge's duplicate judge decides, with its cached verdicts;
+`--no-shared` keeps each paper's copy and asks nothing). Papers that ended without reactions, or not complete, are left
+out and named. Their quotes, issues and QA results come along. It is written as `<title>.annotation.json` and
+`<title>.staged_instances.json` in the results folder (and, with `--owner`, among that curator's annotations).
+
+```bash
+scripts/annotate_spreadsheet.sh papers.xlsx --jobs 3 --hierarchy --group-by "Drug(s)" --title "AML drug response"
+```
+
+#### Opening command-line results in the front-end
+
+`<name>.annotation.json` is the whole annotation as the service keeps it (draft, quotes, issues, suggested fixes, QA
+results, the papers' text), so a command-line run can be opened in Paper2Path like one started there: the reactions with
+their issues and suggested fixes, the entities, the general issues, the network, chat and proposed edits. An annotation belongs to one curator, by their
+login name. Two ways to give it to one:
+
+1. **While annotating**: add `--owner USER`. The annotation is also saved among that curator's annotations, in the
+   service's session folder (`SESSION_DIR` from `.env`, else `data/sessions` of this checkout; `--session-dir DIR` to
+   name another).
+
+   ```bash
+   scripts/annotate_papers.sh paper.pdf --focus WEE1 --owner wgm
+   ```
+
+2. **Later**: add the file to a curator's annotations with `scripts/import_annotation.sh` (several files at once are
+   fine). The same file is added only once; `--replace` overwrites it.
+
+   ```bash
+   scripts/import_annotation.sh annotations/paper.annotation.json --owner marija
+   scripts/import_annotation.sh annotations/*.annotation.json --owner wgm --session-dir /path/to/data/sessions
+   ```
+
+Then reload the Paper2Path page, logged in as that curator: it is listed under **Your annotations**. The service reads
+the session folder on every request, so no restart is needed.
+
+**On the server** (production: `aws_curator_new`, see "Deploying to a Linux server"), copy the `.annotation.json` file there and add it
+from the deployed folder, so it lands in the folder the running service uses:
+
+```bash
+scp annotations/paper.annotation.json aws_curator_new:/tmp/
+ssh aws_curator_new
+cd /usr/local/reactomes/Reactome/production/webbench/curator-tool-llm
+.venv/bin/python -m curator_llm.annotation_files /tmp/paper.annotation.json --owner marija
+chmod -R g+rwX data/sessions        # several people deploy there: keep the annotations group-writable
+```
 
 **In the front-end**, the Paper annotation page has one "Papers to annotate" form: type one or more PubMed IDs and/or add PDFs, then Annotate. Several papers start ONE annotation; its page lists the papers, and each quote says which paper it is from.
 
@@ -467,6 +658,7 @@ Every route is under `/api/llm` and needs the bearer token.
 | `POST /sessions/upload` | Start from PDFs: multipart `file` (one) or `files` (several), optional `pmids` (comma or space separated, to add PubMed papers) and `focus` → `202`. See [Several papers in one session](#several-papers-in-one-session). |
 | `GET /sessions` | Your sessions. |
 | `GET /sessions/{id}` | One session: status, progress, reactions, counts. |
+| `DELETE /sessions/{id}` | Delete one of your sessions for good, with the PDFs uploaded for it → `204`. `409` while it is still queued or running. |
 | `GET /jobs/{jobId}` | Progress of the background job. |
 | `GET /sessions/{id}/issues` | Everything needing attention (`?status=open\|resolved\|dismissed`). |
 | `PATCH /sessions/{id}/issues/{issueId}` | `{"status": "resolved"\|"dismissed"\|"open"}`. |
@@ -481,6 +673,7 @@ Every route is under `/api/llm` and needs the bearer token.
 | `POST /sessions/{id}/qa` | Check every reaction at once (about 15 s for 11 reactions) and return them most urgent first, with the findings recorded as issues. |
 | `GET`, `POST /sessions/{id}/proposals` | List, or submit your own edit as an RFC 6902 patch. |
 | `POST /sessions/{id}/proposals/{pid}/accept` , `/reject` | Decide a proposed edit. |
+| `DELETE /sessions/{id}/reactions/{key}` | Remove a reaction, as the curator's own decision (no quote needed). Recorded as an accepted proposal, so issues, QA, suggestions and other pending proposals (now stale if they no longer apply) follow. |
 | `POST /sessions/{id}/suggestions` | Make the suggested fixes for the draft as it is now (also made when the session is created and after each accepted edit); returns the pending ones. They are proposals with actor `suggestions`: nothing changes until one is accepted. |
 | `GET`, `POST /sessions/{id}/chat` | Read the conversation; send a message (streams). |
 
@@ -524,10 +717,12 @@ call (see the script's header; `--usage extraction=LOG --usage merge=LOG` record
 
 ### Running it for real
 
-- **One worker.** Sessions (unless `SESSION_STORE=mongo`) and background jobs live in the process, so do not start
-  several workers (`--workers`). Restarting the service ends any job still running. With `SESSION_STORE=mongo` finished
-  sessions survive a restart, but one that was still running when the service stopped keeps showing "running" (its job
-  is gone, and nothing marks it failed): start that paper again.
+- **One worker.** Background jobs (and sessions, with `SESSION_STORE=memory`) live in the process, and the file store
+  expects a single writer, so do not start several workers (`--workers`). Restarting the service ends any job still
+  running. With the file store (the default) or `SESSION_STORE=mongo`, finished sessions survive a restart. With the
+  file store, a session that was still running when the service stopped is marked failed at the next start ("The
+  service restarted before this annotation finished"), so the curator knows to start it again. With mongo it keeps
+  showing "running": start that paper again.
 - **Behind a reverse proxy**, do not let it buffer responses for the chat route, or the live steps arrive in one lump
   (the service already sends `X-Accel-Buffering: no` for nginx), and allow long-running requests.
 - **Browsers** may only call it from the origins in `CORS_ORIGINS`.

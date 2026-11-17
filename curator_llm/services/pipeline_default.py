@@ -7,13 +7,14 @@ import os
 import time
 from typing import Callable, Dict, List, Optional
 
+from curator_llm.models.reactome import ExistingRef
 from curator_llm.models.session import Issue
 from curator_llm.ports.external import OntologyClient, UniProtClient
 from curator_llm.ports.lookup import InstanceLookup
 from curator_llm.models.usage import UsageEntry, entry_from_counts
 from curator_llm.ports.events import EventLookup
 from curator_llm.ports.extractor import Extractor
-from curator_llm.ports.pipeline import PipelineInput, PipelineResult
+from curator_llm.ports.pipeline import PipelineFailed, PipelineInput, PipelineResult
 from curator_llm.services import issues as iss
 from curator_llm.services.draft_builder import build_draft
 from curator_llm.services.evidence_attach import attach_evidence
@@ -32,9 +33,13 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 class DefaultPipeline:
     def __init__(self, lookup: InstanceLookup, uniprot: Optional[UniProtClient] = None,
                  ontology: Optional[OntologyClient] = None, model=None, review: bool = False,
-                 timeout: int = 1800, extractor: Optional[Extractor] = None, events: Optional[EventLookup] = None):
+                 timeout: int = 1800, extractor: Optional[Extractor] = None, events: Optional[EventLookup] = None,
+                 compartment_model=None, compartments: Optional[bool] = None):
         self.lookup, self.uniprot, self.ontology = lookup, uniprot, ontology
         self.model, self.events = model, events
+        # where each participant is, from the paper (services/compartments.py); COMPARTMENTS=0 turns it off
+        self.compartment_model = compartment_model
+        self.compartments = (os.getenv('COMPARTMENTS', '1') != '0') if compartments is None else compartments
         self.extractor = extractor or SubprocessExtractor(timeout=timeout, review=review)
 
     def run(self, spec: PipelineInput, report: Callable[[str], None]) -> PipelineResult:
@@ -46,13 +51,17 @@ class DefaultPipeline:
         res = self._extract(spec, gene, report)
         reactions: List[dict] = res.reactions
         if not res.ok or not reactions:
-            raise RuntimeError(('no reactions could be extracted from these papers' if len(refs) > 1 else
-                                'no reactions could be extracted from this paper') +
-                               f' (no open-access full text, or nothing reaction-like in it): {res.error or ""}'.strip())
+            unreached = any(v.get('state') == 'incomplete' for v in res.paper_status.values())
+            why = ('the model or PubMed Central could not be reached: run again to finish' if unreached else
+                   'no open-access full text, or nothing reaction-like in it')
+            raise PipelineFailed(('no reactions could be extracted from these papers' if len(refs) > 1 else
+                                  'no reactions could be extracted from this paper') + f' ({why}): {res.error or ""}'.rstrip(': '),
+                                 res.paper_status)
 
         paper_for, papers = self._paper_loader(spec)
         result = self.assemble(spec, reactions, paper_for, papers, report)
         # what the script steps spent comes first, then the draft call that assemble() recorded
+        result.paper_status, result.complete = dict(res.paper_status), res.complete
         result.usage = [entry_from_counts(step, counts) for step, counts in res.step_usage.items()
                         if any(counts.values())] + result.usage
         if res.warnings:                          # e.g. one of several papers could not be read: say so, keep the rest
@@ -60,17 +69,22 @@ class DefaultPipeline:
         return result
 
     def _extract(self, spec: PipelineInput, gene: str, report: Callable[[str], None]):
-        """Run the extractor, passing `report` along when it takes one (a custom Extractor may not)."""
+        """Run the extractor, passing `report` (and, for one paper, `review`) along when it takes them (a custom Extractor
+        may not)."""
         refs = spec.refs()
         method = self.extractor.extract if len(refs) == 1 else getattr(self.extractor, 'extract_many', None)
         if method is None:
             raise ValueError('this extractor handles one paper at a time')
         try:
-            takes_report = 'report' in inspect.signature(method).parameters
+            params = inspect.signature(method).parameters
         except (TypeError, ValueError):
-            takes_report = False
-        args = (refs[0].pmid, refs[0].pdf_path, gene) if len(refs) == 1 else (refs, gene)
-        return method(*args, report=report) if takes_report else method(*args)
+            params = {}
+        kw = {'report': report} if 'report' in params else {}
+        if len(refs) == 1:
+            if 'review' in params:                    # extract_many reads it from each PaperRef instead
+                kw['review'] = bool(refs[0].review)
+            return method(refs[0].pmid, refs[0].pdf_path, gene, **kw)
+        return method(refs, gene, **kw)
 
     def _accessions(self, symbols: List[str]) -> Dict[str, Optional[str]]:
         """{symbol: human UniProt accession or None}; best effort (a failed lookup leaves names to match on)."""
@@ -105,6 +119,35 @@ class DefaultPipeline:
             return papers[src]
         return paper_for, papers
 
+    def _place(self, draft, store, papers: Dict[str, Optional[PaperText]], spec: PipelineInput, usage: list,
+               report: Callable[[str], None]) -> List[Issue]:
+        """Compartments from the paper (services/compartments.py). Never fails the annotation: a failure is an issue."""
+        from curator_llm.services.compartments import assign_compartments, reference_names
+        vocab_rows = getattr(self.lookup, 'compartments', None)
+        refs = spec.refs()
+        texts = {src: p.text for src, p in papers.items() if src != 'main' and p is not None and p.text}
+        if not texts and papers.get('main') is not None and refs:          # a single PDF is loaded under 'main'
+            texts = {refs[0].source: papers['main'].text}
+        if vocab_rows is None or not texts:      # a lookup without Reactome's compartment list, or no text: skip
+            logger.info('compartments skipped: %s', 'no compartment list' if vocab_rows is None else 'no paper text')
+            return []
+        report('placing each participant in its compartment, from the paper')
+        try:
+            vocab = {r['displayName']: ExistingRef(db_id=r['dbId'], display_name=r['displayName'],
+                                                   schema_class='Compartment') for r in vocab_rows()}
+            model = self.compartment_model
+            if model is None:
+                import sys
+                sys.path.insert(0, os.path.join(ROOT, 'reactome_llm'))
+                from ModelConfig import create_chat_model
+                model = create_chat_model('compartments')
+            return assign_compartments(draft, {e.id: e for e in store.all()}, texts, vocab, model, usage,
+                                       extra_names=reference_names(self.lookup, self.uniprot))
+        except Exception as e:
+            logger.warning('compartments failed: %s', e)
+            return [Issue(source='compartments', severity='warning', code='compartments_failed',
+                          message=f'compartments could not be placed ({type(e).__name__}: {e}); set them by hand')]
+
     def assemble(self, spec: PipelineInput, reactions: List[dict], paper_for, papers: Dict[str, Optional[PaperText]],
                  report: Callable[[str], None], draft=None) -> PipelineResult:
         """Everything after extraction: verify quotes, build the typed draft, resolve identifiers, look for
@@ -137,8 +180,13 @@ class DefaultPipeline:
 
         lap('quote verification + draft build')
         report('resolving identifiers')
-        issues += iss.issues_from_notes('resolver', Resolver(self.lookup, self.uniprot, self.ontology).resolve(draft))
+        resolver = Resolver(self.lookup, self.uniprot, self.ontology)
+        issues += iss.issues_from_notes('resolver', resolver.resolve(draft))
         lap('identifier resolution')
+        if self.compartments and draft.reactions:
+            issues += self._place(draft, store, papers, spec, usage, report)
+            issues += iss.issues_from_notes('resolver', resolver.match_existing(draft))
+            lap('compartments')
         if spec.pathway_id:
             issues += place_in_pathway(draft, spec.pathway_id, self.lookup)
         if spec.partner and spec.focus:

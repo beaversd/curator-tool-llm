@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 from curator_llm.models.session import ChatMessage, Session
 from curator_llm.models.usage import UsageEntry
 from curator_llm.ports.chat_model import ChatModel
+from curator_llm.ports.graph import KINDS as GRAPH_KINDS, ReactomeGraph
 from curator_llm.services.session_service import ProposalError, SessionService
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,11 @@ How to work
 - To see whether Reactome already has a reaction, call find_existing_reactome. Report what it finds and let the
   curator decide; only if they ask, record the decision with a patch that sets /reactions/<key>/existing to
   {db_id, display_name, schema_class} of that event (the reaction is then reused, not added as new).
+- To see how Reactome already models something (the existing entities of a protein and their compartments, the
+  reactions it takes part in, a pathway's events, an existing reaction's participants), use reactome_search,
+  reactome_instance, reactome_entities and reactome_events. They report Reactome's curated knowledge, NOT this paper:
+  never use them as evidence for a reaction, and say plainly when an answer comes from Reactome rather than the paper.
+  The graph is a Reactome release, so very recent curation may be missing.
 - If a tool returns an error, read it, fix the problem and retry once; if it still fails, tell the curator why.
 
 Curation rules
@@ -72,6 +78,16 @@ TOOLS: List[Dict[str, Any]] = [
     {'name': 'resolve_identifier', 'description': 'Look up an identifier in Reactome / UniProt. type: uniprot (gene or protein name), compartment, go_function, chebi (small molecule name), psi_mod (MOD:xxxxx).',
      'input_schema': {'type': 'object', 'properties': {'name': {'type': 'string'}, 'type': {'type': 'string', 'enum': ['uniprot', 'compartment', 'go_function', 'chebi', 'psi_mod']}},
                       'required': ['name', 'type']}},
+    {'name': 'reactome_search', 'description': 'Find Reactome instances by name (case-insensitive, exact names first). kind: pathway, reaction, protein, complex, set, small_molecule, drug or any. Returns dbId, stable id, name, class, species (human by default).',
+     'input_schema': {'type': 'object', 'properties': {'text': {'type': 'string'}, 'kind': {'type': 'string', 'enum': list(GRAPH_KINDS)},
+                                                       'species': {'type': 'string', 'description': 'default Homo sapiens; empty for any'}},
+                      'required': ['text']}},
+    {'name': 'reactome_instance', 'description': 'One Reactome instance by dbId or stable id (R-HSA-...): class, name, species, compartments; for a reaction its inputs, outputs, catalysts, regulators, PMIDs and pathways; for a pathway its events; for a complex or set its components or members; for an entity its reference (UniProt/ChEBI) and modifications. Names come with dbIds you can follow.',
+     'input_schema': {'type': 'object', 'properties': {'id': {'type': 'string'}}, 'required': ['id']}},
+    {'name': 'reactome_entities', 'description': 'The existing Reactome entities on one reference identifier of any kind: UniProt accession, ChEBI id, a drug\'s Guide to Pharmacology ligand id, PubChem, ENSEMBL or miRBase id. Prefix it (CHEBI:30616, GtoP:8708, PubChem:..., ENSEMBL:..., UniProt:..., miRBase:...) since a bare number can be several. Each result has its database, reference type, compartment, whether it is modified, and how many complexes/sets contain it. Reactome often files a small molecule under its charged form and a drug under its Guide to Pharmacology id: if an id finds nothing, search the name with reactome_search (kind small_molecule or drug).',
+     'input_schema': {'type': 'object', 'properties': {'identifier': {'type': 'string'}}, 'required': ['identifier']}},
+    {'name': 'reactome_events', 'description': 'Reactome reactions in which an entity on a reference identifier takes part (any kind, prefixed as for reactome_entities; also inside complexes and sets), with its roles (input, output, catalyst, regulator) and up to 3 pathways each.',
+     'input_schema': {'type': 'object', 'properties': {'identifier': {'type': 'string'}}, 'required': ['identifier']}},
     {'name': 'propose_patch', 'description': 'Propose an edit to the draft. Nothing changes until the curator accepts it.',
      'input_schema': {'type': 'object', 'properties': {
          'reason': {'type': 'string'},
@@ -89,8 +105,14 @@ def _clip(obj: Any) -> str:
 
 
 class ChatAgent:
-    def __init__(self, service: SessionService, model: ChatModel, max_steps: int = 8):
-        self.service, self.model, self.max_steps = service, model, max_steps
+    def __init__(self, service: SessionService, model: ChatModel, max_steps: int = 8,
+                 graph: Optional[ReactomeGraph] = None):
+        self.service, self.model, self.max_steps, self.graph = service, model, max_steps, graph
+
+    @property
+    def tools(self) -> List[Dict[str, Any]]:
+        """The Reactome graph tools only when a graph is configured."""
+        return TOOLS if self.graph is not None else [t for t in TOOLS if not t['name'].startswith('reactome_')]
 
     # ── context ────────────────────────────────────────────────────────────
     @staticmethod
@@ -157,6 +179,8 @@ class ChatAgent:
                 return {'error': str(e)}
         if name == 'resolve_identifier':
             return self._resolve(args.get('name', ''), args.get('type', ''))
+        if name.startswith('reactome_'):
+            return self._graph(name, args)
         if name == 'propose_patch':
             try:
                 p = self.service.propose(owner, session_id, args.get('ops') or [], args.get('reason', ''),
@@ -167,6 +191,32 @@ class ChatAgent:
             proposals.append(p.id)
             emit('proposal', p.model_dump(mode='json'))
             return {'proposal_id': p.id, 'status': 'pending - awaiting the curator', 'summary': p.summary}
+        return {'error': f'unknown tool {name}'}
+
+    def _graph(self, name: str, args: Dict[str, Any]) -> Any:
+        """Read-only Reactome lookups (ports/graph.py); results are Reactome's knowledge, not the paper's."""
+        if self.graph is None:
+            return {'error': 'the Reactome graph is not configured'}
+        if name == 'reactome_search':
+            text = (args.get('text') or '').strip()
+            if len(text) < 2:
+                return {'error': 'give at least 2 characters to search for'}
+            kind = args.get('kind') or 'any'
+            if kind not in GRAPH_KINDS:
+                return {'error': f'kind must be one of {list(GRAPH_KINDS)}'}
+            species = args.get('species')
+            rows = self.graph.search_reactome(text, kind, 'Homo sapiens' if species is None else species)
+            return rows or {'found': [], 'note': f'nothing in Reactome named like {text!r}'}
+        if name == 'reactome_instance':
+            got = self.graph.reactome_instance(str(args.get('id') or ''))
+            return got or {'error': f'no Reactome instance {args.get("id")!r}'}
+        ident = (args.get('identifier') or '').strip()
+        if not ident:
+            return {'error': 'give a reference identifier (UniProt, CHEBI:, GtoP:, PubChem:, ENSEMBL:, miRBase:)'}
+        if name == 'reactome_entities':
+            return self.graph.entities_of(ident) or {'found': [], 'note': f'no Reactome entity for {ident}'}
+        if name == 'reactome_events':
+            return self.graph.events_of(ident) or {'found': [], 'note': f'no Reactome reaction involves {ident}'}
         return {'error': f'unknown tool {name}'}
 
     def _resolve(self, name: str, kind: str) -> Any:
@@ -226,7 +276,7 @@ class ChatAgent:
             history = [{'role': m.role, 'content': m.text} for m in s.chat[-HISTORY_MESSAGES:]]
             messages: List[Dict[str, Any]] = history + [{'role': 'user', 'content': self._selection(s, selected) + message}]
             for _ in range(self.max_steps):
-                turn = self.model.turn(SYSTEM, messages, TOOLS, lambda t: emit('text', {'delta': t}))
+                turn = self.model.turn(SYSTEM, messages, self.tools, lambda t: emit('text', {'delta': t}))
                 spent.calls += 1
                 if turn.usage is not None:
                     spent.input_tokens += turn.usage.input_tokens
