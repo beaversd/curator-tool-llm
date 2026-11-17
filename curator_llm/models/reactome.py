@@ -6,7 +6,7 @@ id: unresolved things stay as new instances with `needs_resolution` set for the 
 """
 from typing import Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ExistingRef(BaseModel):
@@ -30,8 +30,23 @@ class _Participant(BaseModel):
     name: str
     compartment: Optional[ExistingRef] = None
     compartment_name: Optional[str] = None   # kept so an unresolved compartment is not silently lost
+    # how the compartment was found (services/compartments.py): stated | shown (by the paper, with compartment_quote) |
+    # parts (all its components placed, in one compartment) | curator (a suggestion the curator accepted) | None
+    compartment_source: Optional[str] = None
+    compartment_quote: Optional[str] = None
+    # no evidence in the paper: a likely compartment from general knowledge, offered as a suggested fix (never applied);
+    # accepting it sets the compartment with source 'curator'
+    compartment_suggested: Optional[ExistingRef] = None
     needs_resolution: List[str] = Field(default_factory=list)   # e.g. ["uniprot", "compartment"]
+    # other names of the molecule (the paper's name before a rename, UniProt short names and gene synonyms): used to
+    # find it in the paper's text (services/compartments.py)
+    aliases: List[str] = Field(default_factory=list)
     existing: Optional[ExistingRef] = None   # set when this exact entity already exists: emit a shell
+
+    @field_validator('needs_resolution')
+    @classmethod
+    def _once_each(cls, v: List[str]) -> List[str]:
+        return list(dict.fromkeys(v))        # sessions saved before the resolver reset its flags repeat them
 
 
 class EwasSpec(_Participant):
@@ -41,7 +56,10 @@ class EwasSpec(_Participant):
     molecule: Literal['protein', 'dna', 'rna'] = 'protein'
     uniprot: Optional[str] = None
     reference_entity: Optional[ExistingRef] = None   # existing ReferenceGeneProduct
+    # the organism the molecule comes from: a viral or bacterial protein in a host-pathogen paper is not human.
+    # species_ref is the Species instance it resolves to (None for human, which the emitter knows already).
     species: str = 'Homo sapiens'
+    species_ref: Optional[ExistingRef] = None
     start_coordinate: Optional[int] = None
     end_coordinate: Optional[int] = None
     modifications: List[ModifiedResidueSpec] = Field(default_factory=list)
@@ -92,6 +110,7 @@ class ReactionSpec(BaseModel):
     catalyst: Optional[CatalystSpec] = None
     regulations: List[RegulationSpec] = Field(default_factory=list)
     compartment: Optional[ExistingRef] = None
+    compartments: List[ExistingRef] = Field(default_factory=list)   # every compartment it happens in (its participants')
     summation: str = ''
     pmids: List[str] = Field(default_factory=list)
     evidence_ids: List[str] = Field(default_factory=list)
@@ -107,6 +126,17 @@ class PathwaySpec(BaseModel):
     reactions: List[str] = Field(default_factory=list)   # reaction keys
     summation: str = ''
     pmids: List[str] = Field(default_factory=list)
+    # pathways inside this one (emitted as events of it, before its reactions); a reaction may be listed in several
+    subpathways: List['PathwaySpec'] = Field(default_factory=list)
+
+    def walk(self, path: str = '/pathway'):
+        """(JSON-pointer path, pathway) for this pathway and every one inside it, parents first."""
+        yield path, self
+        for i, sp in enumerate(self.subpathways):
+            yield from sp.walk(f'{path}/subpathways/{i}')
+
+
+PathwaySpec.model_rebuild()
 
 
 class ReactomeDraft(BaseModel):

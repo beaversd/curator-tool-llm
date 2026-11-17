@@ -183,6 +183,44 @@ Reading it:
   expression" reactions whose target genes are never named in the text (likely a supplementary table). Paper 32448362
   needs SMAD complexes the extraction never saw. No setting change recovers these.
 
+### 7a. Direct evidence, extraction exclusions and site-aware merging (2026-11)
+
+Changes: research papers drop reactions whose every quote is `cited` (`services/direct_evidence.py`; reviews keep them,
+`--review`); the extraction prompt excludes hypotheses/model predictions, cell-level outcomes, intra-complex structural
+contacts and tool-only events, and gives a modification site only to the enzyme its sentence names; the merge judge
+treats fewer named sites as less detail. Same 8 papers, the 2 reviews run with `--review` (`ground_truth_eval.py run ...
+--only gtv2`), compared with the stored new-defaults run:
+
+| Setting | Recall (all 8) | Research recall | Entity recall | Reactions (research) |
+|---|---|---|---|---|
+| new defaults (before) | 41/61 | 29/41 | 78% | 91 |
+| **2026-11 changes** | **41/61** | **29/41** | 77% | 86 |
+
+- Recall is the same on every paper. One curated entity fewer was named (24368734: 11/13 vs 12/13), where extraction
+  went from 37 to 23 records and the merge folded them to 11 reactions (was 23).
+- The cited-only filter left out ONE reaction across the six research papers: these are extracted from a tagged Results
+  section, which cites little. It matters for papers read whole (no tagged Results, e.g. the Nature WEE1/CDH1 PDF):
+  there it left out 7 of the reactions, all background stated with references.
+- WEE1/CDH1 PDF (whole paper, 121 chunks): 42 reactions before, 31 after. Gone: the WEE1-at-Thr129 record (a site the
+  text gives to mTOR), the model hypotheses, cell-level outcomes and the degron artefact; site lists no longer split
+  the CDH1 phosphorylation. Still wrong: CDH1 phosphorylation is 3 reactions (the in-vitro N186 fragment and the
+  Xenopus ortholog were kept as named and judged different participants); a quote carrying "(ref. 43)" was tagged
+  `this_paper`; hydrogen-bond records, a hedged Discussion sentence and two figure-legend-only "results" (one the paper
+  contradicts) were still extracted despite the prompt rules.
+
+Then constructs and orthologs as the protein (extraction normalizes "CDH1 N186", "Xenopus FZR (Cdh1)" to CDH1; the
+merge judge treats an assay construct or stand-in ortholog as the protein), same 8 papers (`--only gtv3`):
+
+| Setting | Recall (all 8) | Entity recall | Reactions (all 8) |
+|---|---|---|---|
+| 2026-11 changes above | 41/61 | 77% | 274 |
+| **+ constructs/orthologs as the protein** | **42/61** | **80%** | 258 |
+
+Within noise on recall (one review gained one curated reaction); 16 fewer reactions. On the WEE1/CDH1 PDF the CDH1
+phosphorylation became ONE reaction (six variants folded: no site, Tyr130, Tyr91+Tyr130, "tyrosine residues"), 30
+reactions in all. Run-to-run variation of the extraction is visible there: a negative result ("WEE1 phosphorylates
+CDC20 (negligible)") and a Methods rationale ("CDK1 phosphorylates WEE1") appeared that the previous run did not have.
+
 ## 8. Bugs found along the way
 
 - **Section lookup returned empty replies** for papers without a standard Results heading: thinking used up the tiny
@@ -438,8 +476,34 @@ concern the instance-list view that recent `nl-query` commits changed, so they a
 no clean baseline run was made (it would have meant stashing uncommitted changes), so that is not proven. One earlier
 full run also failed in `InstanceEffects` once, and did not recur. The form has not been looked at in a browser.
 
-**Test suites at the end of this work:** service repo 296 passed, 1 skipped (the skipped test needs a real
+**Test suites at the end of the previous step:** service repo 296 passed, 1 skipped (the skipped test needs a real
 curator-tool-ws); front-end as above. Nothing is deployed to the server and nothing is committed.
+
+### Fixing what the output showed, and suggesting fixes (2026-11-02)
+
+The real clock Science PDF + PMID 32448362 run (22 reactions, 88 open issues) showed problems; the ones that were bugs are
+fixed, and the ones that need judgement are offered as **suggested fixes**. Nothing is fixed automatically: a suggestion
+is a pending proposal (actor `suggestions`) that changes the draft only when a curator accepts it.
+
+| Problem in the output | What was done | Measured (live Reactome graph, 25 gene/transcript entities and 22 reactions of that run) |
+|---|---|---|
+| 22 serious "Reactome already has this reaction" issues, mostly wrong | Genes and transcripts have no UniProt accession, so a reaction about them is no longer compared (an info note says so); a match on the enzyme alone is never "same" | "same" matches 22 -> 6; 16 reactions skipped as gene/transcript reactions |
+| 24 "new reference must be set" warnings, new ReferenceDNASequences for genes Reactome has | The resolver looks the gene symbol up among Reactome's ReferenceDNA/RNASequence and reuses the HUMAN one (the species is a graph relationship, so the lookup reads it from there); several candidates: the one named exactly, with a "confirm it" note; none stands out: no guess | new DNA references 15 -> 0, RNA 10 -> 9, warnings 24 -> 10; 16 of 25 reuse a human reference, no non-human id |
+| An enzyme listed as an input (and not an output); a reaction with nothing changing | Structural checks (`qa_no_inputs`/`outputs`/`change`, catalyst and regulator rules, and the new `qa_catalyst_is_consumed`) now run on every refresh and show as issues (source `checks`) without a QA run. The evidence rules stay on demand | on the saved run: 2 `checks` issues (1 consumed enzyme, 1 no-change) |
+| Body text labelled "Abstract" in a PDF with no headings | A text whose only heading is Abstract is labelled "Main Text" after 2,500 characters or the next page | tests only |
+| Suggested fixes | `services/suggestions.py`: remove a consumed enzyme from the inputs (not when that would leave no input); cite the PubMed papers a reaction's quotes come from when it has no PMID. Made when a session is created and after each accepted proposal; `POST /sessions/{id}/suggestions`; `<name>.suggestions.json` from the command line; a "Suggested fixes" tab in the workspace. A rejected one is not made again; a pending one that no longer applies is dropped | on the saved run: 0 suggestions (its one consumed enzyme is the reaction's only input, so removing it would be wrong) |
+
+**Not fixable safely, so left to the curator:** invented states such as "(repressed)"; related-but-different reactions kept
+separate (and duplicates the merge missed: a patch cannot move evidence between reactions); evidence from another species
+(whether to infer a human reaction is a curation decision); ChEBI identifiers (still flagged). The suggestions skip the
+usual "needs a quote" rule because the curator who accepts one is the one deciding; the quote requirement still holds for
+anything the chat proposes.
+
+**What was not run:** the clock PDF was not at hand, so the whole pipeline was not rerun on it; the live numbers come from
+re-resolving the saved draft against the graph, and the suggestion count from the saved run. The Suggested fixes tab has
+been tested in specs and compiled, not looked at in a browser.
+
+Tests: service repo 317 passed, 1 skipped; paper-annotation front-end 145 pass.
 
 ## 11. How to reproduce
 

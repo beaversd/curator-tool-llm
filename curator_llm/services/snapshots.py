@@ -45,7 +45,8 @@ def _paper_key(ref: PaperRef) -> str:
 def snapshot_key(spec: PipelineInput) -> str:
     """pmid-24751536__PINK1, or pdf-<hash of the file>__PINK1; for several papers multi-<hash of their keys, in any order>.
     The focus changes what the draft is about."""
-    keys = [_paper_key(r) for r in spec.refs()]
+    # a review keeps the reactions it only cites, so the same paper gives a different result: '+review' on its key
+    keys = [_paper_key(r) + ('+review' if r.review else '') for r in spec.refs()]
     if not keys:
         raise ValueError('need a pmid or a pdf')
     base = keys[0] if len(keys) == 1 else 'multi-' + hashlib.sha256('|'.join(sorted(keys)).encode()).hexdigest()[:16]
@@ -120,6 +121,9 @@ class SnapshotPipeline:
                 saved.replayed = True              # its usage is the original run's, not spent now
                 return saved
         result = self.inner.run(spec, report)
+        if not result.complete:                # a paper missing or unmerged: replaying it would hide that
+            logger.info('snapshot %s not saved: the run is incomplete', key)
+            return result
         try:
             self.store.save(key, result)
         except Exception as e:               # failing to save must never fail the annotation

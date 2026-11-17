@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from curator_llm.adapters.sessions_memory import InMemorySessionStore
 from curator_llm.api.app import create_app
 from curator_llm.ports.chat_model import ModelTurn, ToolCall
-from tests.fakes.ports import FakeAuthProvider, FakeInstanceLookup, FakeUniProt, SyncJobRunner
+from tests.fakes.ports import FakeAuthProvider, FakeInstanceLookup, FakeReactomeGraph, FakeUniProt, SyncJobRunner
 from tests.test_edit_api import Pipe, Q2, TOKENS, H
 from curator_llm.services.resolvers import Resolver
 
@@ -36,12 +36,12 @@ def final(text):
 CCCP = [{'op': 'add', 'path': '/reactions/r0/regulations/-', 'value': {'kind': 'positive', 'regulator': 'cccp', 'note': 'after CCCP'}}]
 
 
-def setup(turns):
+def setup(turns, graph=None):
     model = ScriptedModel(turns)
     gk = [{'dbId': 17906, 'displayName': 'mitochondrial outer membrane', 'schemaClassName': 'Compartment'}]
     app = create_app(FakeAuthProvider(TOKENS), InMemorySessionStore(), SyncJobRunner(), Pipe(),
                      resolver_factory=lambda: Resolver(FakeInstanceLookup(gk), FakeUniProt({}, {'PINK1': 'Q9BXM7'})),
-                     chat_model=model)
+                     chat_model=model, graph=graph)
     c = TestClient(app)
     sid = c.post('/api/llm/sessions', json={'pmid': '24751536'}, headers=H()).json()['sessionId']
     return c, sid, model
@@ -191,3 +191,30 @@ def test_chat_history_is_readable_after_the_turn_and_private():
     assert hist[0]['text'] == 'add CCCP' and hist[1]['text'] == 'proposed' and hist[1]['proposal_ids'] == ['p-001']
     assert c.get(f'/api/llm/sessions/{sid}/chat', headers=H('bob')).status_code == 404
     assert c.get(f'/api/llm/sessions/{sid}/chat').status_code == 401
+
+
+def test_reactome_graph_tools_answer_read_only_and_only_when_a_graph_is_configured():
+    graph = FakeReactomeGraph(
+        names=[{'dbId': 5205685, 'stId': 'R-HSA-5205685', 'displayName': 'PINK1-PRKN Mediated Mitophagy', 'schemaClass': 'Pathway'}],
+        instances={'R-HSA-5205685': {'dbId': 5205685, 'displayName': 'PINK1-PRKN Mediated Mitophagy',
+                                     'events': [{'dbId': 9834076, 'name': 'PINK1 is autophosphorylated'}]}},
+        entities={'Q9BXM7': [{'dbId': 5205653, 'displayName': 'PINK1 [mitochondrial outer membrane]',
+                              'compartment': 'mitochondrial outer membrane', 'modified': False}]},
+        events={'Q9BXM7': [{'dbId': 9834076, 'displayName': 'PINK1 is autophosphorylated', 'roles': ['input', 'catalyst']}]})
+    c, sid, model = setup([tool('reactome_search', text='mitophagy', kind='pathway'),
+                           tool('reactome_instance', id='R-HSA-5205685'), tool('reactome_entities', identifier='Q9BXM7'),
+                           tool('reactome_events', identifier='Q9BXM7'), tool('reactome_search', text='x'),
+                           tool('reactome_search', text='mito', kind='organelle'), tool('reactome_instance', id='999'),
+                           final('ok')], graph=graph)
+    chat(c, sid, 'how does Reactome model PINK1?')
+    res = lambda i: json.loads(model.calls[i]['messages'][-1]['content'][0]['content'])
+    assert 'reactome_events' in model.calls[0]['tools'] and 'Reactome\'s curated knowledge, NOT this paper' in model.calls[0]['system']
+    assert res(1)[0]['stId'] == 'R-HSA-5205685' and graph.calls[0] == ('search', 'mitophagy', 'pathway', 'Homo sapiens')
+    assert res(2)['events'][0]['name'] == 'PINK1 is autophosphorylated'
+    assert res(3)[0]['compartment'] == 'mitochondrial outer membrane' and res(4)[0]['roles'] == ['input', 'catalyst']
+    assert 'at least 2 characters' in res(5)['error'] and 'kind must be one of' in res(6)['error']
+    assert 'no Reactome instance' in res(7)['error']
+    # without a graph the tools are not offered at all
+    c, sid, model = setup([final('ok')])
+    chat(c, sid, 'hi')
+    assert not any(t.startswith('reactome_') for t in model.calls[0]['tools'])

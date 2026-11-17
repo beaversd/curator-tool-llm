@@ -57,7 +57,7 @@ def test_several_papers_become_one_merged_draft_with_all_the_result_files(tmp_pa
     spec = pipe.calls[0]
     assert [r.source for r in spec.refs()] == ['a.PDF', 'b.pdf', 'PMID:24751536', 'PMID:29168502'] and spec.focus == 'PINK1'
     out = tmp_path / 'out'
-    assert sorted(os.listdir(out)) == ['together.evidence.json', 'together.issues.json', 'together.session.json', 'together.staged_instances.json']
+    assert sorted(os.listdir(out)) == ['together.annotation.json', 'together.evidence.json', 'together.issues.json', 'together.progress.json', 'together.session.json', 'together.staged_instances.json', 'together.suggestions.json']
     assert json.load(open(out / 'together.staged_instances.json'))['newInstances']
     sess = json.load(open(out / 'together.session.json'))
     assert sess['n_reactions'] == 5 and [p['kind'] for p in sess['papers']] == ['pdf', 'pdf', 'pmid', 'pmid'] and sess['source'].startswith('4 papers: ')
@@ -100,7 +100,7 @@ def test_a_failing_session_does_not_stop_the_others_and_the_exit_code_says_so(tm
     folder.mkdir()
     code, pipe, lines = run([pdf(folder, 'boom.pdf'), pdf(folder, 'fine.pdf'), '--separate'], tmp_path)
     assert code == 1 and len(pipe.calls) == 2
-    assert any('FAILED: RuntimeError: no full text' in m for m in lines) and any('1 session(s) done, 1 failed (boom)' in m for m in lines)
+    assert any('FAILED: RuntimeError: no full text' in m for m in lines) and any('1 session(s) done, 0 partial, 1 failed; failed: boom' in m for m in lines)
     assert os.path.isfile(tmp_path / 'out' / 'fine.staged_instances.json') and not os.path.exists(tmp_path / 'out' / 'boom.staged_instances.json')
 
 
@@ -145,3 +145,18 @@ def test_pmid_parsing_and_files(tmp_path):
     f = tmp_path / 'ids.txt'
     f.write_text('# my papers\n24751536\n\n29168502  # second\n24751536\n')
     assert collect_papers([], ['11111111'], [str(f)]) == ([], ['11111111', '24751536', '29168502'])
+
+
+def test_suggested_fixes_are_written_as_proposals_and_not_applied(tmp_path):
+    class EnzymeInInputs(FakePipeline):
+        def run(self, spec, report):
+            res = super().run(spec, report)
+            res.draft.reactions[0].inputs.append('pink1')                      # the enzyme listed as a substrate
+            return res
+    code, pipe, lines = run(['--pmid', '24751536'], tmp_path, EnzymeInInputs())
+    out = tmp_path / 'out'
+    sug = json.load(open(out / 'pmid-24751536.suggestions.json'))
+    assert code == 0 and len(sug) == 1 and sug[0]['status'] == 'pending' and sug[0]['actor'] == 'suggestions'
+    assert sug[0]['ops'][0]['op'] == 'remove'
+    assert json.load(open(out / 'pmid-24751536.session.json'))['n_suggested_fixes'] == 1
+    assert any('1 suggested fixes' in m for m in lines)

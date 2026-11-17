@@ -131,9 +131,10 @@ def test_stale_proposal_is_detected(env):
     e = propose(c, sid, [{'op': 'add', 'path': '/reactions/r0/regulations/-', 'value': {'kind': 'positive', 'regulator': 'cccp'}}],
                 evidence=[{'quote': Q2}]).json()['id']
     assert c.post(f'/api/llm/sessions/{sid}/proposals/{d}/accept', headers=H()).status_code == 200
-    r = c.post(f'/api/llm/sessions/{sid}/proposals/{e}/accept', headers=H())
-    assert r.status_code == 409 and 'no longer applies' in r.json()['detail']
+    # accepting d made e stale at once, so it is no longer offered; accepting it anyway is refused
     assert c.get(f'/api/llm/sessions/{sid}/proposals?status=stale', headers=H()).json()[0]['id'] == e
+    r = c.post(f'/api/llm/sessions/{sid}/proposals/{e}/accept', headers=H())
+    assert r.status_code == 409 and 'stale' in r.json()['detail']
 
 
 def test_paper_search_and_privacy(env):
@@ -176,3 +177,11 @@ def test_cors_allows_the_frontend_origin_only(env):
     bad = c.options('/api/llm/sessions', headers={'Origin': 'http://evil.example', 'Access-Control-Request-Method': 'GET'})
     assert ok.headers.get('access-control-allow-origin') == 'http://localhost:4200'
     assert 'access-control-allow-origin' not in bad.headers
+
+
+def test_suggestions_endpoint_returns_pending_proposals_and_is_private(env):
+    c, sid, _ = env
+    r = c.post(f'/api/llm/sessions/{sid}/suggestions', headers=H())
+    assert r.status_code == 200 and all(p['actor'] == 'suggestions' and p['status'] == 'pending' for p in r.json())
+    assert c.post('/api/llm/sessions/nope/suggestions', headers=H()).status_code == 404
+    assert c.post(f'/api/llm/sessions/{sid}/suggestions').status_code == 401
